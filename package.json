@@ -1,0 +1,32 @@
+{
+  "name": "pi-workflows",
+  "version": "0.1.0",
+  "description": "Code-driven multi-agent workflow orchestration for pi: deterministic, code-routed phases of isolated sub-agents, plus a skill that teaches the agent to author them.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "workflows",
+    "agents",
+    "multi-agent",
+    "orchestration"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    ".pi/extensions",
+    ".pi/skills",
+    ".pi/agents",
+    "examples",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [".pi/extensions/workflows/index.ts"],
+    "skills": [".pi/skills"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}

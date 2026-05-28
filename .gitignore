@@ -1,0 +1,9 @@
+# Private workflows — not included in the package
+.pi/workflows/*.js
+
+# Git clone artifacts
+.pi/git/
+.pi/npm/
+
+# OS
+.DS_Store
