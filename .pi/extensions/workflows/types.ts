@@ -1,9 +1,11 @@
 /**
- * Workflows - Type definitions
+ * Workflows — Type definitions (imperative format)
  *
- * A workflow replaces the LLM orchestrator with code. Sub-agent outputs
- * flow from one phase to the next directly, never touching the main
- * context window.
+ * A workflow is an async function that orchestrates isolated sub-agents in code.
+ * The engine injects the primitives (agent / parallel / pipeline / phase / log);
+ * the deterministic control flow — loops, conditionals, transforms — is plain JS
+ * in the author's own function body. Sub-agent outputs flow through ordinary JS
+ * variables and never touch the main context window.
  */
 
 // ── Schema types ──────────────────────────────────────────────────────────
@@ -11,7 +13,7 @@
 export interface SchemaField {
   type: "string" | "number" | "boolean" | "array" | "object";
   description: string;
-  /** When true, the phase output must contain this field (validated post-parse). */
+  /** When true, the agent output must contain this field (validated post-parse). */
   required?: boolean;
   items?: SchemaField;
   properties?: Record<string, SchemaField>;
@@ -33,7 +35,7 @@ export interface Schema {
 export type FieldSpec = string | SchemaField;
 
 /**
- * What a phase's `schema` accepts. Either the longhand `{ fields: {...} }`
+ * What an agent() call's `schema` accepts. Either the longhand `{ fields: {...} }`
  * form, or a flat shorthand map `{ name: FieldSpec, ... }`. (A shorthand map
  * therefore cannot have a top-level field literally named `fields`.)
  */
@@ -48,7 +50,7 @@ export type ThinkingLevel =
   | "high"
   | "xhigh";
 
-// ── Control flow types ────────────────────────────────────────────────────
+// ── Config ────────────────────────────────────────────────────────────────
 
 export interface BudgetConfig {
   maxTokens?: number;
@@ -56,99 +58,107 @@ export interface BudgetConfig {
   maxTurns?: number;
 }
 
-export interface LoopConfig {
-  maxIterations: number;
-  condition: (ctx: PhaseContext) => boolean;
-  /** Builds this iteration's prompt from the index (0-based) + ctx. If omitted,
-   *  the phase's `prompt` is reused each iteration. */
-  promptTemplate?: (index: number, ctx: PhaseContext) => string;
-}
+// ── Imperative authoring surface ──────────────────────────────────────────
 
-export interface PhaseContext {
-  /** Results of all prior completed phases, keyed by phase name.
-   *  For parallel results, use phaseName.subPhaseName. */
-  previous: Record<string, any>;
-  /** Free-text input supplied when the run was started (run_workflow's `input`
-   *  param, or the args after `/workflow <name>`). Empty string if none. */
-  input: string;
-  workflow: WorkflowRunState;
-}
-
-// ── Phase definitions ─────────────────────────────────────────────────────
-
-export interface ParallelPhaseDef {
-  name: string;
-  description?: string;
+/**
+ * Per-call options for `agent()` — the surviving subset of the old
+ * PhaseDefinition. Everything else (control flow, data flow, deterministic
+ * work) is now plain JS in the workflow body.
+ */
+export interface AgentOptions {
+  /** Named persona from `~/.pi/agent/agents` or `.pi/agents`. Supplies default
+   *  model / tools / thinking / system prompt; the options below override it. */
   agent?: string;
-  /** Prompt for a sub-agent (a **model** sub-phase). String or function of ctx. */
-  prompt?: string | ((ctx: PhaseContext) => string);
-  /** Deterministic **code** sub-phase: plain JS, no model. Return value is the output. */
-  code?: (ctx: PhaseContext) => any | Promise<any>;
+  /** Model pattern (e.g. "claude-haiku-4-5"); overrides the persona's; falls
+   *  back to the main session's model. */
   model?: string;
+  /** Tool allowlist for this sub-agent. Default: `["read","bash","edit","write"]`.
+   *  Use `[]` for a pure-reasoning agent that only returns a result. */
   tools?: string[];
-  systemPrompt?: string;
-  /** Thinking level for this sub-phase's sub-agent (overrides the agent's). */
+  /** Thinking level; overrides the persona's. Default "off". */
   thinking?: ThinkingLevel;
-  schema?: SchemaInput;
-  timeout?: number;
-}
-
-export interface PhaseDefinition {
-  name: string;
-  description?: string;
-  /** Named agent from ~/.pi/agent/agents/ or .pi/agents/ */
-  agent?: string;
-  /**
-   * **Model phase.** The prompt sent to a sub-agent (a model). A static string,
-   * or a function of `ctx` that builds the prompt from prior results / input.
-   * Use a model phase when the step needs *judgment* (writing, reasoning,
-   * analysis, extracting from messy input).
-   */
-  prompt?: string | ((ctx: PhaseContext) => string);
-  /**
-   * **Code phase.** Deterministic plain JS instead of a sub-agent. Receives the
-   * same `ctx` (previous / input / workflow); its return value becomes the phase
-   * output. No model, no tokens. Use a code phase for *mechanical* work —
-   * transform, filter, sort, format, fetch, compute — and to interleave logic
-   * between models (model → code → model).
-   *
-   * A phase needs exactly one of `prompt`, `code`, or `parallel`.
-   */
-  code?: (ctx: PhaseContext) => any | Promise<any>;
-  model?: string;
-  tools?: string[];
+  /** Extra system-prompt text, appended after the persona's. */
   systemPrompt?: string;
-  /** Thinking level for this phase's sub-agent (overrides the agent's, default "off"). */
-  thinking?: ThinkingLevel;
+  /** When set, the sub-agent must deliver a structured object via the
+   *  `provide_result` tool; agent() returns that validated object. */
   schema?: SchemaInput;
-  /** Run multiple sub-phases in parallel. Results keyed as phaseName.subName. */
-  parallel?: ParallelPhaseDef[];
-  /** Skip this phase if condition returns false. */
-  condition?: (ctx: PhaseContext) => boolean;
-  /** Loop execution. promptTemplate receives iteration index (0-based) + context. */
-  loop?: LoopConfig;
-  /** Number of automatic retries on failure (default 0). */
+  /** Automatic retries on failure (default 0 → 1 attempt). A schema mismatch
+   *  counts as a failure, so retries also re-roll bad structured output. */
   retries?: number;
   /** Delay between retries in ms (default 2000). */
   retryDelay?: number;
-  /** Max duration per attempt in ms. */
+  /** Max duration per attempt in ms (default 300000). */
   timeout?: number;
-  /** Budget limits for this phase. */
+  /** Budget for this call; merged over the run-level budget (this wins).
+   *  Advisory — surfaced to the sub-agent as guidance, not hard-enforced. */
   budget?: BudgetConfig;
-  /** Transform output before passing to subsequent phases. */
-  map?: (result: any, ctx: PhaseContext) => any;
+  /** Display name for this step in /workflows (replaces the old phase `name`).
+   *  Unlabeled calls auto-number within the current phase() group. */
+  label?: string;
 }
 
-// ── Workflow definition ───────────────────────────────────────────────────
+/**
+ * The single argument injected into a workflow's default-export function. All
+ * orchestration happens through these primitives; everything else is plain JS.
+ */
+export interface WorkflowRuntime {
+  /** Run one isolated sub-agent. Returns its final text, or — when `opts.schema`
+   *  is set — the validated structured object. Throws on failure (after retries),
+   *  so native `try/catch` works. */
+  agent: (prompt: string, opts?: AgentOptions) => Promise<any>;
+  /** Run thunks concurrently (a barrier — awaits all). Results come back in input
+   *  order; a thunk that throws yields `null` in its slot (filter with
+   *  `.filter(Boolean)`), and the failure is still visible as a failed step. */
+  parallel: <T>(thunks: Array<() => Promise<T>>) => Promise<Array<T | null>>;
+  /** Run each item through all stages independently (no barrier between items):
+   *  stage k receives stage k-1's output for that item. Results in input order;
+   *  an item whose chain throws yields `null` (others continue). */
+  pipeline: (
+    items: any[],
+    ...stages: Array<(item: any, index: number) => any | Promise<any>>
+  ) => Promise<any[]>;
+  /** Open a named progress group; subsequent agent() steps show under it in
+   *  /workflows. Pure progress/UX — no model, no tokens. */
+  phase: (title: string) => void;
+  /** Emit a narrator line shown in /workflows. No model, no tokens. */
+  log: (msg: string) => void;
+  /** Free-text input the run was started with (run_workflow's `input` param, or
+   *  the args after `/workflow <name>`). Empty string if none. */
+  args: string;
+  /** Working directory the run was launched from. */
+  cwd: string;
+  /** Run-level default budget (per-call `opts.budget` overrides). */
+  budget?: BudgetConfig;
+}
 
-export interface WorkflowDefinition {
+/** Metadata exported alongside the default-export workflow function. */
+export interface WorkflowMeta {
+  /** Unique workflow id — the `/workflow <name>` key and discovery key. */
+  name: string;
+  /** Shown in /workflow-list and list_workflows. */
+  description?: string;
+  /** Display-only static flow hint for /workflow-list. Use a `"name⇉"` suffix to
+   *  mark a parallel group. Ignored by the engine — live progress is built from
+   *  phase()/agent() calls. Omit for a "dynamic" listing. */
+  phases?: string[];
+}
+
+/** The default-export shape every workflow file provides. */
+export type WorkflowFn = (rt: WorkflowRuntime) => Promise<any> | any;
+
+/** Internal: a discovered, loaded workflow (engine-side, not authored). */
+export interface LoadedWorkflow {
   name: string;
   description?: string;
-  phases: PhaseDefinition[];
+  phases?: string[];
+  fn: WorkflowFn;
 }
 
-// ── Runtime state ─────────────────────────────────────────────────────────
+// ── Runtime state ──────────────────────────────────────────────────────────
 
+/** One recorded step (an agent() call) in a run. The shape is unchanged from
+ *  the declarative era, so the run store, RPC readers, and the TUI are reused
+ *  verbatim; `phaseName` is now the step's display label. */
 export interface PhaseResult {
   phaseName: string;
   status: "pending" | "running" | "completed" | "failed" | "skipped";
@@ -170,8 +180,14 @@ export interface WorkflowRunState {
   id: string;
   name: string;
   status: "running" | "completed" | "failed" | "cancelled";
+  /** Steps keyed by display label, in call order (one per agent() call). */
   phases: Record<string, PhaseResult>;
+  /** The current phase() group, shown in the below-editor run widget. */
   currentPhase?: string;
+  /** The workflow function's return value — the run's deliverable. */
+  result?: any;
+  /** Narrator lines from log() — ephemeral progress, shown in /workflows. */
+  logs?: string[];
   startTime: number;
   endTime?: number;
   error?: string;
@@ -198,6 +214,8 @@ export interface PersistedRun {
   status: WorkflowRunState["status"] | "interrupted";
   phases: Record<string, PhaseResult>;
   currentPhase?: string;
+  /** The workflow's deliverable (return value). Added in schemaVersion 2. */
+  result?: any;
   startTime: number;
   endTime?: number;
   error?: string;

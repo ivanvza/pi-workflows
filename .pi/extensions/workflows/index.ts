@@ -48,25 +48,30 @@ import {
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type {
+  AgentOptions,
   BudgetConfig,
   FieldSpec,
+  LoadedWorkflow,
   PersistedRun,
-  PhaseContext,
-  PhaseDefinition,
   PhaseResult,
   Schema,
   SchemaField,
   SchemaInput,
   ThinkingLevel,
-  WorkflowDefinition,
+  WorkflowFn,
+  WorkflowMeta,
   WorkflowRunState,
+  WorkflowRuntime,
 } from "./types.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
 // ═══════════════════════════════════════════════════════════════════════════
 
-const MAX_PARALLEL_TASKS = 8;
+// Max items a single parallel()/pipeline() call dispatches at once. The global
+// semaphore (GLOBAL_MAX_AGENTS) is the real ceiling on concurrent sub-agents;
+// this just bounds how aggressively one fan-out call queues work. Arbitrarily
+// long input arrays are fine — excess items queue and run as slots free up.
 const MAX_CONCURRENCY = 4;
 const DEFAULT_RETRY_DELAY = 2000;
 const PHASE_TIMEOUT_MS = 300_000; // 5 min default
@@ -114,13 +119,6 @@ function generateId(): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-function resolvePrompt(
-  prompt: string | ((ctx: PhaseContext) => string),
-  ctx: PhaseContext,
-): string {
-  return typeof prompt === "function" ? prompt(ctx) : prompt;
 }
 
 function formatTokens(count: number): string {
@@ -729,164 +727,275 @@ async function runSubagent(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Phase Execution
+// Imperative Runtime
+//
+// A workflow is an async function the author writes; the engine injects the
+// primitives (agent / parallel / pipeline / phase / log) and ALL control flow
+// (loops, conditionals, transforms) lives in the author's own JS. Each agent()
+// call runs as one isolated sub-agent (runSubagent) and is recorded as a step in
+// the live WorkflowRunState, so /workflows, the run store, and RPC readers see
+// progress exactly as the declarative engine did.
 // ═══════════════════════════════════════════════════════════════════════════
 
-interface PhaseOutcome {
-  output: any;
-  usage: Usage;
+type WorkflowRunCallback = (state: WorkflowRunState) => void;
+
+/**
+ * Owns the live WorkflowRunState and is the ONLY thing that mutates it.
+ * `phase(title)` opens a named group; each agent() call is one step (a
+ * PhaseResult) keyed uniquely and shown under the current group. Unlabeled steps
+ * auto-number within their group (`<group>/agent-N`) so progress is never empty
+ * mid-run. Inline JS between agent() calls intentionally produces no step.
+ */
+class ProgressRecorder {
+  readonly state: WorkflowRunState;
+  private readonly onProgress: WorkflowRunCallback;
+  private group = "";
+  private stepSeq = 0;
+  private readonly usedKeys = new Set<string>();
+
+  constructor(state: WorkflowRunState, onProgress: WorkflowRunCallback) {
+    this.state = state;
+    this.onProgress = onProgress;
+  }
+
+  private emit(): void {
+    this.onProgress(this.state);
+  }
+
+  /** Open a progress group; subsequent agent() steps display under it. */
+  setPhase(title: string): void {
+    this.group = title;
+    this.state.currentPhase = title;
+    this.emit();
+  }
+
+  /** Append a narrator line (ephemeral; shown in /workflows, not persisted). */
+  log(msg: string): void {
+    (this.state.logs ??= []).push(msg);
+    this.emit();
+  }
+
+  /** Reserve a unique key and open a running step. Returns the key. */
+  startStep(label?: string): string {
+    this.stepSeq += 1;
+    const base = label?.trim() || `${this.group || "step"}/agent-${this.stepSeq}`;
+    let key = base;
+    let n = 2;
+    while (this.usedKeys.has(key)) key = `${base} (${n++})`;
+    this.usedKeys.add(key);
+    this.state.phases[key] = {
+      phaseName: this.group && label ? `${this.group} · ${label}` : base,
+      status: "running",
+      attempts: 1,
+    };
+    this.state.currentPhase = this.group || base;
+    this.emit();
+    return key;
+  }
+
+  /** Record the current attempt number on a running step (for retry display). */
+  setAttempt(key: string, attempt: number): void {
+    const pr = this.state.phases[key];
+    if (pr) {
+      pr.attempts = attempt;
+      this.emit();
+    }
+  }
+
+  finishStep(key: string, output: any, usage: Usage, duration: number): void {
+    const prev = this.state.phases[key];
+    this.state.phases[key] = {
+      phaseName: prev?.phaseName ?? key,
+      status: "completed",
+      output,
+      usage,
+      duration,
+      attempts: prev?.attempts ?? 1,
+    };
+    this.emit();
+  }
+
+  failStep(key: string, error: string, usage: Usage, duration: number, attempts: number): void {
+    const prev = this.state.phases[key];
+    this.state.phases[key] = {
+      phaseName: prev?.phaseName ?? key,
+      status: "failed",
+      error,
+      usage,
+      duration,
+      attempts,
+    };
+    this.emit();
+  }
 }
 
-async function executeSinglePhase(
-  phase: PhaseDefinition,
-  ctx: PhaseContext,
+/**
+ * Build the run-bound `agent()` primitive. Wraps runSubagent with persona/option
+ * resolution (per-call options override the named agent's defaults — same
+ * precedence as the old executeSinglePhase), schema normalization, an internal
+ * retry loop (a schema mismatch is a retryable failure), structured extraction,
+ * and progress recording. Returns the text (no schema) or the validated object
+ * (with schema); throws after exhausting retries so native try/catch works.
+ */
+function makeAgentPrimitive(
   cwd: string,
-  signal: AbortSignal | undefined,
-  budget: BudgetConfig | undefined,
   agents: Map<string, AgentConfig>,
-): Promise<PhaseOutcome> {
-  // ── Deterministic code phase ────────────────────────────────────────────
-  // A phase with `code` executes plain JS instead of a sub-agent: no model, no
-  // tokens, instant. Its return value becomes the phase output and flows to
-  // later phases via ctx.previous, exactly like a model phase's output. This
-  // lets you interleave code between models: model → code (logic) → model.
-  if (phase.code) {
-    const output = await phase.code(ctx);
-    if (phase.schema) {
-      // Optional: validate the returned object against the schema, same as models.
-      validateSchema(normalizeSchema(phase.schema), output, phase.name);
-    }
-    return { output, usage: emptyUsage() };
-  }
-
-  const taskStr = resolvePrompt(phase.prompt ?? "", ctx);
-  const timeout = phase.timeout ?? PHASE_TIMEOUT_MS;
-  const mergedBudget: BudgetConfig = { ...budget, ...phase.budget };
-
-  // Resolve the named agent (if any) into model / tools / system prompt.
-  // Phase-level overrides win; the agent supplies the defaults.
-  let agent: AgentConfig | undefined;
-  if (phase.agent) {
-    agent = agents.get(phase.agent);
-    if (!agent) {
-      const available = Array.from(agents.keys()).map((n) => `"${n}"`).join(", ") || "none";
-      throw new Error(`Phase "${phase.name}" references unknown agent "${phase.agent}". Available: ${available}.`);
-    }
-  }
-  const model = phase.model ?? agent?.model;
-  const tools = phase.tools ?? agent?.tools;
-  const thinking = phase.thinking ?? agent?.thinking;
-  const schema = phase.schema ? normalizeSchema(phase.schema) : undefined;
-  const systemPromptExtra =
-    [agent?.systemPrompt, phase.systemPrompt].filter((s) => s && s.trim()).join("\n\n") || undefined;
-
-  const result = await runSubagent(
-    cwd,
-    taskStr,
-    model,
-    tools,
-    systemPromptExtra,
-    schema,
-    mergedBudget,
-    thinking,
-    timeout,
-    signal,
-  );
-
-  const usage = result.usage ?? emptyUsage();
-
-  if (result.exitCode !== 0 || result.stopReason === "error") {
-    throw new Error(
-      result.errorMessage || result.stderr || `Phase exited with code ${result.exitCode}`,
-    );
-  }
-
-  // Extract structured output or raw text
-  const finalText = getFinalAssistantText(result.messages);
-  if (schema) {
-    // Prefer the provide_result tool call; fall back to parsing a JSON block
-    // from the final text in case the model answered in prose anyway.
-    const parsed = result.structured ?? extractJsonFromText(finalText);
-    if (!parsed) {
-      throw new Error(`Phase "${phase.name}" did not produce valid structured output. Response: ${finalText.slice(0, 500)}`);
-    }
-    validateSchema(schema, parsed, phase.name);
-    return { output: parsed, usage };
-  }
-
-  return { output: finalText, usage };
-}
-
-async function executeParallelPhase(
-  phase: PhaseDefinition,
-  ctx: PhaseContext,
-  cwd: string,
+  runBudget: BudgetConfig | undefined,
   signal: AbortSignal | undefined,
-  budget: BudgetConfig | undefined,
-  agents: Map<string, AgentConfig>,
-): Promise<PhaseOutcome> {
-  const subPhases = phase.parallel!;
+  recorder: ProgressRecorder,
+): (prompt: string, opts?: AgentOptions) => Promise<any> {
+  return async function agent(prompt: string, opts: AgentOptions = {}): Promise<any> {
+    const key = recorder.startStep(opts.label);
+    const started = Date.now();
+    const agg = emptyUsage();
+    const fail = (msg: string, attempts: number): never => {
+      recorder.failStep(key, msg, agg, Date.now() - started, attempts);
+      throw new Error(msg);
+    };
 
-  if (subPhases.length > MAX_PARALLEL_TASKS) {
-    throw new Error(`Too many parallel tasks (${subPhases.length}). Max is ${MAX_PARALLEL_TASKS}.`);
-  }
-
-  const results: Record<string, any> = {};
-  const usage = emptyUsage();
-  const errors: string[] = [];
-
-  // Concurrency-limited parallel execution
-  let nextIndex = 0;
-  const workers = new Array(Math.min(MAX_CONCURRENCY, subPhases.length))
-    .fill(null)
-    .map(async () => {
-      while (true) {
-        const idx = nextIndex++;
-        if (idx >= subPhases.length) return;
-        const sub = subPhases[idx];
-        try {
-          // Build a synthetic PhaseDefinition for the sub-phase. The sub-phase
-          // inherits the parent's agent/model/tools/prompt unless it sets its own.
-          const subPhase: PhaseDefinition = {
-            name: sub.name,
-            description: sub.description,
-            agent: sub.agent ?? phase.agent,
-            prompt: sub.prompt,
-            code: sub.code,
-            model: sub.model ?? phase.model,
-            tools: sub.tools ?? phase.tools,
-            thinking: sub.thinking ?? phase.thinking,
-            systemPrompt: sub.systemPrompt ?? phase.systemPrompt,
-            schema: sub.schema,
-            timeout: sub.timeout ?? phase.timeout,
-          };
-          const outcome = await executeSinglePhase(subPhase, ctx, cwd, signal, budget, agents);
-          results[sub.name] = outcome.output;
-          addUsage(usage, outcome.usage);
-        } catch (err: any) {
-          results[sub.name] = null;
-          errors.push(`[${sub.name}] ${err.message}`);
-        }
+    // Resolve the named persona into defaults; per-call options win.
+    let persona: AgentConfig | undefined;
+    if (opts.agent) {
+      persona = agents.get(opts.agent);
+      if (!persona) {
+        const available = Array.from(agents.keys()).map((n) => `"${n}"`).join(", ") || "none";
+        fail(`Unknown agent "${opts.agent}". Available: ${available}.`, 1);
       }
-    });
+    }
+    const model = opts.model ?? persona?.model;
+    const tools = opts.tools ?? persona?.tools;
+    const thinking = opts.thinking ?? persona?.thinking;
+    const schema = opts.schema ? normalizeSchema(opts.schema) : undefined;
+    const systemPromptExtra =
+      [persona?.systemPrompt, opts.systemPrompt].filter((s) => s && s.trim()).join("\n\n") ||
+      undefined;
+    const budget: BudgetConfig | undefined =
+      runBudget || opts.budget ? { ...runBudget, ...opts.budget } : undefined;
+    const timeout = opts.timeout ?? PHASE_TIMEOUT_MS;
+    const maxAttempts = 1 + (opts.retries ?? 0);
+    const retryDelay = opts.retryDelay ?? DEFAULT_RETRY_DELAY;
 
+    let lastError: Error | undefined;
+    let attemptsMade = 0;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      attemptsMade = attempt;
+      if (signal?.aborted) fail("Aborted", attempt);
+      if (attempt > 1) recorder.setAttempt(key, attempt);
+      try {
+        const result = await runSubagent(
+          cwd,
+          prompt,
+          model,
+          tools,
+          systemPromptExtra,
+          schema,
+          budget,
+          thinking,
+          timeout,
+          signal,
+        );
+        addUsage(agg, result.usage);
+        if (result.exitCode !== 0 || result.stopReason === "error") {
+          throw new Error(
+            result.errorMessage || result.stderr || `Sub-agent exited with code ${result.exitCode}`,
+          );
+        }
+        const finalText = getFinalAssistantText(result.messages);
+        let output: any;
+        if (schema) {
+          const parsed = result.structured ?? extractJsonFromText(finalText);
+          if (!parsed) {
+            throw new Error(
+              `Sub-agent did not produce valid structured output. Response: ${finalText.slice(0, 500)}`,
+            );
+          }
+          validateSchema(schema, parsed, opts.label ?? key);
+          output = parsed;
+        } else {
+          output = finalText;
+        }
+        recorder.finishStep(key, output, agg, Date.now() - started);
+        return output;
+      } catch (err: any) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (signal?.aborted) break; // don't retry a cancelled run
+        if (attempt < maxAttempts) await sleep(retryDelay);
+      }
+    }
+    return fail(lastError?.message ?? "Agent failed", attemptsMade);
+  };
+}
+
+/**
+ * `parallel(thunks)` — run thunks concurrently behind a worker pool (dispatch
+ * capped at MAX_CONCURRENCY; the global semaphore in runSubagent still bounds
+ * total sub-agents). Barrier: awaits all. Results in INPUT order. A thunk that
+ * throws yields `null` in its slot (the failure stays visible as that agent's
+ * failed step), so one bad task never aborts the batch — filter with
+ * `.filter(Boolean)`.
+ */
+async function runParallel<T>(thunks: Array<() => Promise<T>>): Promise<Array<T | null>> {
+  const results: Array<T | null> = new Array(thunks.length).fill(null);
+  let next = 0;
+  const workers = new Array(Math.min(MAX_CONCURRENCY, thunks.length)).fill(null).map(async () => {
+    while (true) {
+      const idx = next++;
+      if (idx >= thunks.length) return;
+      try {
+        results[idx] = await thunks[idx]();
+      } catch {
+        results[idx] = null;
+      }
+    }
+  });
   await Promise.all(workers);
+  return results;
+}
 
-  if (errors.length > 0) {
-    throw new Error(`Parallel phase "${phase.name}" had ${errors.length} failure(s):\n${errors.join("\n")}`);
-  }
-
-  return { output: results, usage };
+/**
+ * `pipeline(items, ...stages)` — each item flows through ALL stages independently
+ * (stage k gets stage k-1's output for that item), no barrier between items, so
+ * one item can be in stage 3 while another is still in stage 1. Dispatch capped
+ * at MAX_CONCURRENCY items in flight. Results in input order; an item whose chain
+ * throws yields `null` (others continue).
+ */
+async function runPipeline(
+  items: any[],
+  ...stages: Array<(item: any, index: number) => any | Promise<any>>
+): Promise<any[]> {
+  const results: any[] = new Array(items.length).fill(null);
+  let next = 0;
+  const workers = new Array(Math.min(MAX_CONCURRENCY, items.length)).fill(null).map(async () => {
+    while (true) {
+      const idx = next++;
+      if (idx >= items.length) return;
+      try {
+        let acc: any = items[idx];
+        for (const stage of stages) acc = await stage(acc, idx);
+        results[idx] = acc;
+      } catch {
+        results[idx] = null;
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Workflow Engine
 // ═══════════════════════════════════════════════════════════════════════════
 
-type WorkflowRunCallback = (state: WorkflowRunState) => void;
-
-async function executeWorkflow(
-  workflowDef: WorkflowDefinition,
+/**
+ * Run an imperative workflow: build the live state + a ProgressRecorder, assemble
+ * the runtime (the injected primitives + args/cwd/budget), and call the author's
+ * function EXACTLY ONCE. Its return value is the run's deliverable (state.result;
+ * falls back to the last completed step's output if the body returns nothing). A
+ * thrown error fails the run with the partial steps preserved — same terminal
+ * semantics as the declarative engine.
+ */
+async function runImperativeWorkflow(
+  loaded: LoadedWorkflow,
   cwd: string,
   onProgress: WorkflowRunCallback,
   signal: AbortSignal | undefined,
@@ -895,218 +1004,50 @@ async function executeWorkflow(
 ): Promise<WorkflowRunState> {
   const state: WorkflowRunState = {
     id: runId ?? generateId(),
-    name: workflowDef.name,
+    name: loaded.name,
     status: "running",
     phases: {},
     startTime: Date.now(),
   };
-
-  const previous: Record<string, any> = {};
+  const recorder = new ProgressRecorder(state, onProgress);
   const agents = discoverAgents(cwd);
+  const runBudget: BudgetConfig | undefined = undefined; // reserved for a future run-level budget
+
+  const runtime: WorkflowRuntime = {
+    agent: makeAgentPrimitive(cwd, agents, runBudget, signal, recorder),
+    parallel: runParallel,
+    pipeline: runPipeline,
+    phase: (title: string) => recorder.setPhase(title),
+    log: (msg: string) => recorder.log(msg),
+    args: input,
+    cwd,
+    budget: runBudget,
+  };
 
   try {
-    for (const phase of workflowDef.phases) {
-      if (signal?.aborted) {
-        state.status = "cancelled";
-        break;
-      }
-
-      state.currentPhase = phase.name;
-
-      // Initialize phase result
-      state.phases[phase.name] = {
-        phaseName: phase.name,
-        status: "pending",
-      };
-
-      // Validate the phase has exactly one kind of work. Without this, a phase
-      // missing prompt/code/parallel (e.g. a typo'd field, or an older engine
-      // that doesn't recognize a newer field) would silently run a model with
-      // an empty prompt instead of failing.
-      const hasParallel = (phase.parallel?.length ?? 0) > 0;
-      const hasCode = typeof phase.code === "function";
-      const hasPrompt = phase.prompt != null;
-      if (!hasParallel && !hasCode && !hasPrompt) {
-        state.phases[phase.name] = {
-          phaseName: phase.name,
-          status: "failed",
-          error: `Phase "${phase.name}" has no prompt, code, or parallel.`,
-          duration: 0,
-          attempts: 0,
-        };
-        state.status = "failed";
-        state.error = state.phases[phase.name].error;
-        break;
-      }
-
-      // Check condition
-      const phaseCtx: PhaseContext = { previous: { ...previous }, input, workflow: state };
-      if (phase.condition && !phase.condition(phaseCtx)) {
-        state.phases[phase.name] = {
-          phaseName: phase.name,
-          status: "skipped",
-          duration: 0,
-          attempts: 0,
-        };
-        onProgress(state);
-        continue;
-      }
-
-      // Execute (possibly with retries and loop)
-      await executePhaseWithRetries(phase, phaseCtx, cwd, signal, state, onProgress, previous, agents);
-
-      onProgress(state);
-
-      // Check if phase failed and propagate
-      const pr = state.phases[phase.name];
-      if (pr.status === "failed") {
-        state.status = "failed";
-        state.error = pr.error;
-        break;
-      }
+    const returned = await loaded.fn(runtime);
+    // The return value is the deliverable. If the body returned nothing, fall
+    // back to the last completed step's output so trivial bodies still surface a
+    // result. Save it BEFORE checking the abort signal so a run that finished
+    // just as it was cancelled doesn't silently lose its output.
+    let deliverable = returned;
+    if (deliverable === undefined) {
+      const completed = Object.values(state.phases).filter(
+        (p) => p.status === "completed" && p.output != null,
+      );
+      deliverable = completed.length ? completed[completed.length - 1].output : undefined;
     }
-
-    if (state.status === "running") {
-      state.status = "completed";
-    }
-    state.endTime = Date.now();
-    state.currentPhase = undefined;
-    onProgress(state);
-
-    return state;
+    state.result = deliverable;
+    state.status = signal?.aborted ? "cancelled" : "completed";
   } catch (err: any) {
-    state.status = "failed";
-    state.error = err.message;
-    state.endTime = Date.now();
-    state.currentPhase = undefined;
-    onProgress(state);
-    return state;
-  }
-}
-
-async function executePhaseWithRetries(
-  phase: PhaseDefinition,
-  ctx: PhaseContext,
-  cwd: string,
-  signal: AbortSignal | undefined,
-  state: WorkflowRunState,
-  onProgress: WorkflowRunCallback,
-  previous: Record<string, any>,
-  agents: Map<string, AgentConfig>,
-): Promise<void> {
-  const maxAttempts = 1 + (phase.retries ?? 0);
-  const retryDelay = phase.retryDelay ?? DEFAULT_RETRY_DELAY;
-
-  const shouldLoop = phase.loop != null;
-  const maxIterations = shouldLoop ? phase.loop!.maxIterations : 1;
-
-  const phaseStart = Date.now();
-  const aggUsage = emptyUsage();
-  let totalAttempts = 0;
-  let lastOutput: any;
-  let ranAtLeastOnce = false;
-
-  const cancel = () => {
-    state.phases[phase.name] = {
-      phaseName: phase.name,
-      status: "failed",
-      error: "Cancelled",
-      usage: aggUsage,
-      duration: Date.now() - phaseStart,
-      attempts: totalAttempts,
-    };
-  };
-
-  for (let iteration = 0; iteration < maxIterations; iteration++) {
-    if (signal?.aborted) return cancel();
-
-    // After the first iteration, the loop condition decides whether to continue.
-    // It sees this phase's latest output via `previous`.
-    if (shouldLoop && iteration > 0 && phase.loop!.condition) {
-      const loopCtx: PhaseContext = { previous: { ...previous }, input: ctx.input, workflow: state };
-      if (!phase.loop!.condition(loopCtx)) break;
-    }
-
-    // Build the prompt for this iteration (model phases). Code phases have no
-    // prompt — phase.prompt is undefined and the branch in executeSinglePhase
-    // runs the code instead.
-    let promptText: string;
-    if (shouldLoop && phase.loop!.promptTemplate) {
-      const loopCtx: PhaseContext = { previous: { ...previous }, input: ctx.input, workflow: state };
-      promptText = phase.loop!.promptTemplate(iteration, loopCtx);
-    } else {
-      promptText = resolvePrompt(phase.prompt ?? "", ctx);
-    }
-    // Carry the resolved prompt so executeSinglePhase uses this iteration's text.
-    const iterPhase: PhaseDefinition = { ...phase, prompt: promptText };
-
-    let lastError: Error | undefined;
-    let succeeded = false;
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      if (signal?.aborted) return cancel();
-      totalAttempts++;
-
-      state.phases[phase.name] = {
-        phaseName: shouldLoop ? `${phase.name}[${iteration}]` : phase.name,
-        status: "running",
-        attempts: attempt + 1,
-        usage: { ...aggUsage },
-        duration: Date.now() - phaseStart,
-      };
-      onProgress(state);
-
-      try {
-        const outcome =
-          phase.parallel && phase.parallel.length > 0
-            ? await executeParallelPhase(iterPhase, ctx, cwd, signal, phase.budget, agents)
-            : await executeSinglePhase(iterPhase, ctx, cwd, signal, phase.budget, agents);
-
-        addUsage(aggUsage, outcome.usage);
-        let output = outcome.output;
-
-        // Apply map transform
-        if (phase.map) {
-          const mapCtx: PhaseContext = { previous: { ...previous }, input: ctx.input, workflow: state };
-          output = phase.map(output, mapCtx);
-        }
-
-        lastOutput = output;
-        ranAtLeastOnce = true;
-        // Visible to the next iteration's condition/promptTemplate.
-        previous[phase.name] = output;
-        succeeded = true;
-        break; // exit the retry loop; continue to the next iteration
-      } catch (err: any) {
-        lastError = err;
-        if (attempt < maxAttempts - 1) await sleep(retryDelay);
-      }
-    }
-
-    if (!succeeded) {
-      state.phases[phase.name] = {
-        phaseName: phase.name,
-        status: "failed",
-        error: lastError?.message,
-        usage: aggUsage,
-        duration: Date.now() - phaseStart,
-        attempts: totalAttempts,
-      };
-      return; // Stop looping on failure
-    }
+    state.status = signal?.aborted ? "cancelled" : "failed";
+    if (state.status === "failed") state.error = err?.message ?? String(err);
   }
 
-  // All iterations succeeded (or the loop condition ended it). The stored
-  // output is the final iteration's result.
-  state.phases[phase.name] = {
-    phaseName: phase.name,
-    status: "completed",
-    output: lastOutput,
-    usage: aggUsage,
-    duration: Date.now() - phaseStart,
-    attempts: totalAttempts,
-  };
-  if (ranAtLeastOnce) previous[phase.name] = lastOutput;
+  state.endTime = Date.now();
+  state.currentPhase = undefined;
+  onProgress(state);
+  return state;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1115,7 +1056,7 @@ async function executePhaseWithRetries(
 
 interface WorkflowRegistryEntry {
   run: WorkflowRunState;
-  definition: WorkflowDefinition;
+  definition: LoadedWorkflow;
   abortController?: AbortController;
 }
 
@@ -1178,7 +1119,8 @@ function findRun(nameOrId?: string): WorkflowRunState | undefined {
 // written atomically (write *.json.tmp then rename) so a reader never observes
 // a half-written file. See README "Programmatic / RPC integration".
 
-const RUN_SCHEMA_VERSION = 1;
+// v2 adds `result` (the workflow function's return value / deliverable).
+const RUN_SCHEMA_VERSION = 2;
 const RUN_FILE_EXT = ".json";
 const RUN_TMP_SUFFIX = ".json.tmp";
 /** Coalesce intermediate progress writes to at most one per this interval. */
@@ -1236,6 +1178,7 @@ function toPersistedRun(state: WorkflowRunState, meta: RunMeta): PersistedRun {
     status: state.status,
     phases: state.phases,
     currentPhase: state.currentPhase,
+    result: state.result,
     startTime: state.startTime,
     endTime: state.endTime,
     error: state.error,
@@ -1255,9 +1198,12 @@ function fromPersistedRun(p: PersistedRun): WorkflowRunState {
   return {
     id: p.id,
     name: p.name,
-    status: interrupted ? "failed" : p.status,
+    // Inline comparison (not the `interrupted` const) so TS narrows away the
+    // "interrupted" variant that WorkflowRunState["status"] doesn't include.
+    status: p.status === "interrupted" ? "failed" : p.status,
     phases: p.phases ?? {},
     currentPhase: p.currentPhase,
+    result: p.result,
     startTime: p.startTime,
     endTime: p.endTime,
     error: interrupted
@@ -1331,7 +1277,7 @@ const pendingRunWrite = new Map<string, ReturnType<typeof setTimeout>>();
  * forces an immediate, guaranteed write and clears any pending timer, so the
  * final file is always complete and current. Intermediate progress is coalesced
  * to at most one write per RUN_WRITE_THROTTLE_MS; the trailing write serializes
- * the latest state (executeWorkflow mutates one state object in place).
+ * the latest state (runImperativeWorkflow mutates one state object in place).
  */
 function scheduleRunWrite(state: WorkflowRunState, meta: RunMeta): void {
   const terminal = state.status !== "running";
@@ -1454,13 +1400,13 @@ function pruneRunStore(cwd: string): void {
 // Workflow File Loading
 // ═══════════════════════════════════════════════════════════════════════════
 
-function isWorkflowDef(value: any): value is WorkflowDefinition {
-  return (
-    value &&
-    typeof value === "object" &&
-    typeof value.name === "string" &&
-    Array.isArray(value.phases)
-  );
+/** Resolve the workflow function from a module's default export, tolerating
+ *  jiti/CJS interop that can double-wrap it (`mod.default.default`). */
+function resolveWorkflowFn(mod: Record<string, any>): WorkflowFn | undefined {
+  const d = mod?.default;
+  if (typeof d === "function") return d as WorkflowFn;
+  if (d && typeof d.default === "function") return d.default as WorkflowFn;
+  return undefined;
 }
 
 /** Walk up from cwd to find a `.pi/workflows` directory (mirrors how agents are
@@ -1498,32 +1444,45 @@ function collectWorkflowFiles(cwd: string): string[] {
   return files;
 }
 
-/** Pull every workflow definition out of an imported module (default export,
- *  named exports, or the module-as-workflow fallback). */
+/** Heuristic: does this module look like a RETIRED declarative workflow — a
+ *  `{ name, phases: [ {…}, … ] }` object exported as default or by name? Used
+ *  ONLY to turn a silent "no workflow here" into a precise migration error; the
+ *  declarative format is not supported. (The new `meta.phases` is a `string[]`
+ *  display hint, so we require phases of OBJECTS to avoid false positives.) */
+function looksDeclarative(mod: Record<string, any>): boolean {
+  const isDecl = (v: any): boolean =>
+    !!v &&
+    typeof v === "object" &&
+    typeof v.name === "string" &&
+    Array.isArray(v.phases) &&
+    v.phases.some((p: any) => p && typeof p === "object");
+  return isDecl(mod.default) || Object.values(mod).some(isDecl);
+}
+
+/** Pull the workflow out of an imported module: a default-export function plus
+ *  an exported `meta` (name / description / phases). `meta` may live on the
+ *  module or on the default export; the filename is the last-resort name.
+ *  Returns whether a workflow was found, so the caller can surface a clear error
+ *  for a file that loaded but exported no workflow (rather than dropping it). */
 function extractWorkflows(
   mod: Record<string, any>,
   file: string,
-  into: Map<string, WorkflowDefinition>,
-): void {
-  let found = 0;
-  if (isWorkflowDef(mod.default)) {
-    into.set(mod.default.name, mod.default);
-    found++;
-  }
-  for (const [key, value] of Object.entries(mod)) {
-    if (key === "default") continue;
-    if (isWorkflowDef(value)) {
-      into.set(value.name, value as WorkflowDefinition);
-      found++;
-    }
-  }
-  // Fallback: the module itself might be a workflow (jiti's interopDefault).
-  if (found === 0 && isWorkflowDef(mod)) {
-    into.set(
-      mod.name || path.basename(file, path.extname(file)),
-      mod as unknown as WorkflowDefinition,
-    );
-  }
+  into: Map<string, LoadedWorkflow>,
+): boolean {
+  const fn = resolveWorkflowFn(mod);
+  if (!fn) return false;
+  const meta = (mod.meta ?? (mod.default as any)?.meta ?? {}) as Partial<WorkflowMeta>;
+  const name =
+    typeof meta.name === "string" && meta.name.trim()
+      ? meta.name.trim()
+      : path.basename(file, path.extname(file));
+  into.set(name, {
+    name,
+    description: typeof meta.description === "string" ? meta.description : undefined,
+    phases: Array.isArray(meta.phases) ? meta.phases : undefined,
+    fn,
+  });
+  return true;
 }
 
 /**
@@ -1558,14 +1517,24 @@ async function importWorkflowFile(file: string): Promise<Record<string, any>> {
   }
 }
 
-async function discoverWorkflows(cwd: string): Promise<Map<string, WorkflowDefinition>> {
-  const workflows = new Map<string, WorkflowDefinition>();
+async function discoverWorkflows(cwd: string): Promise<Map<string, LoadedWorkflow>> {
+  const workflows = new Map<string, LoadedWorkflow>();
   const errors: Array<{ file: string; error: string }> = [];
 
   for (const file of collectWorkflowFiles(cwd)) {
     try {
       const mod = await importWorkflowFile(file);
-      extractWorkflows(mod, file, workflows);
+      // A file that imports cleanly but exports no workflow used to vanish with
+      // no feedback — looking like "no workflows configured" rather than "this
+      // file is in the wrong format". Surface a precise, actionable error.
+      if (!extractWorkflows(mod, file, workflows)) {
+        errors.push({
+          file,
+          error: looksDeclarative(mod)
+            ? "uses the retired declarative format ({ name, phases: [...] }). Rewrite as `export default async function (rt) {…}` + `export const meta = { name }` — see .pi/skills/workflows/SKILL.md."
+            : "exported no workflow — expected `export default async function (rt) {…}` (plus `export const meta = { name }`).",
+        });
+      }
     } catch (err: any) {
       // Surface the failure instead of silently swallowing it — a single broken
       // file used to make ALL workflows vanish with no explanation.
@@ -1606,10 +1575,14 @@ function loadErrorsText(): string {
  *  any RPC/orchestrator consumer reading the message stream. A passive toast
  *  gives interactive users visual feedback without consuming context. */
 function startBackgroundRun(
-  def: WorkflowDefinition,
+  def: LoadedWorkflow,
   cwd: string,
   input = "",
   sessionId?: string,
+  // When false, suppress the completion toast + non-waking marker — used when the
+  // caller is already showing the run live (e.g. `/workflow … --wait`). The run is
+  // still registered and persisted exactly the same.
+  announce = true,
 ): string {
   const abortController = new AbortController();
   const runId = generateId();
@@ -1633,7 +1606,7 @@ function startBackgroundRun(
    * reaches an RPC client via the message stream / get_messages, carrying the
    * run id and the path to the full result file.
    */
-  const emitRunMarker = (status: "completed" | "failed", content: string) => {
+  const emitRunMarker = (status: "completed" | "failed" | "cancelled", content: string) => {
     extensionApi?.sendMessage(
       {
         customType: "workflow-status",
@@ -1645,7 +1618,7 @@ function startBackgroundRun(
     );
   };
 
-  executeWorkflow(
+  runImperativeWorkflow(
     def,
     cwd,
     (updated) => {
@@ -1653,7 +1626,7 @@ function startBackgroundRun(
       if (entry) entry.run = updated;
       scheduleRunWrite(updated, meta); // throttled; force-flushes on terminal status
 
-      if (announced) return;
+      if (!announce || announced) return;
       if (updated.status === "completed") {
         announced = true;
         currentCtx?.ui.notify(
@@ -1671,6 +1644,10 @@ function startBackgroundRun(
           "failed",
           `Workflow "${def.name}" (run ${runId}) failed: ${updated.error || "Unknown error"}`,
         );
+      } else if (updated.status === "cancelled") {
+        announced = true;
+        currentCtx?.ui.notify(`Workflow "${def.name}" was cancelled (run ${runId}).`, "warning");
+        emitRunMarker("cancelled", `Workflow "${def.name}" (run ${runId}) was cancelled.`);
       }
     },
     abortController.signal,
@@ -1690,30 +1667,28 @@ function startBackgroundRun(
   return runId;
 }
 
-/** Format a completed run's per-phase outputs into a readable summary,
- *  closing with the token usage that stayed out of the main context.
- *
- *  Intermediate phases are truncated to keep the main context lean, but the
- *  LAST completed phase — typically the workflow's actual deliverable (a report,
- *  a final answer) — is kept in full so it isn't silently clipped. */
-function buildResultText(name: string, state: WorkflowRunState): string {
-  const completed = Object.entries(state.phases).filter(
-    ([, pr]) => pr.status === "completed" && pr.output != null,
+/** The run's deliverable: the workflow function's return value, or — for older
+ *  runs persisted before `result` existed — the last completed step's output. */
+function resolveDeliverable(state: WorkflowRunState): any {
+  if (state.result !== undefined) return state.result;
+  const completed = Object.values(state.phases).filter(
+    (pr) => pr.status === "completed" && pr.output != null,
   );
-  const lastIdx = completed.length - 1;
-  const phaseSummaries: string[] = [];
-  completed.forEach(([phaseName, pr], idx) => {
-    const outputStr =
-      typeof pr.output === "string" ? pr.output : JSON.stringify(pr.output, null, 2);
-    const keepFull = idx === lastIdx;
-    const truncated =
-      keepFull || outputStr.length <= 2000 ? outputStr : `${outputStr.slice(0, 1997)}...`;
-    phaseSummaries.push(`### ${phaseName}\n${truncated}`);
-  });
+  return completed.length ? completed[completed.length - 1].output : undefined;
+}
+
+/** Format a completed run's deliverable into a readable summary, closing with the
+ *  token usage that stayed out of the main context. The deliverable (the
+ *  function's return value) is kept in full; intermediate steps are visible in
+ *  /workflows progress and so are not re-dumped here. */
+function buildResultText(name: string, state: WorkflowRunState): string {
+  const deliverable = resolveDeliverable(state);
   const body =
-    phaseSummaries.length > 0
-      ? phaseSummaries.join("\n\n")
-      : "Workflow completed with no output.";
+    deliverable == null
+      ? "Workflow completed with no output."
+      : typeof deliverable === "string"
+        ? deliverable
+        : JSON.stringify(deliverable, null, 2);
   const usageStr = formatUsage(totalRunUsage(state));
   const usageLine = usageStr
     ? `\n\n_Sub-agents used ${usageStr} — kept out of the main context window._`
@@ -1733,13 +1708,27 @@ function buildResultLines(state: WorkflowRunState, theme: ThemeLike): string[] {
   if (state.error) lines.push(theme.fg("error", `Error: ${state.error}`));
   lines.push("");
 
-  for (const [phaseName, pr] of Object.entries(state.phases)) {
-    lines.push(theme.fg("accent", theme.bold(`### ${phaseName}`)) + theme.fg("dim", ` (${pr.status})`));
-    if (pr.error) lines.push(theme.fg("error", pr.error));
-    if (pr.output != null) {
-      const text =
-        typeof pr.output === "string" ? pr.output : JSON.stringify(pr.output, null, 2);
-      for (const l of text.split("\n")) lines.push(theme.fg("muted", l));
+  // The deliverable (return value), in full.
+  const deliverable = resolveDeliverable(state);
+  if (deliverable != null) {
+    lines.push(theme.fg("accent", theme.bold("### result")));
+    const text =
+      typeof deliverable === "string" ? deliverable : JSON.stringify(deliverable, null, 2);
+    for (const l of text.split("\n")) lines.push(theme.fg("muted", l));
+    lines.push("");
+  }
+
+  // A compact trail of the steps that ran (their full outputs stay out of the
+  // way; they were visible live in /workflows).
+  const steps = Object.values(state.phases);
+  if (steps.length > 0) {
+    lines.push(theme.fg("dim", "Steps:"));
+    for (const pr of steps) {
+      const icon =
+        pr.status === "completed" ? "✓" :
+        pr.status === "failed" ? "✗" :
+        pr.status === "skipped" ? "→" : "○";
+      lines.push(theme.fg("dim", `  ${icon} ${pr.phaseName}`) + (pr.error ? theme.fg("error", ` — ${pr.error.split("\n")[0]}`) : ""));
     }
     lines.push("");
   }
@@ -1874,7 +1863,7 @@ function renderWorkflowProgress(
 }
 
 function renderWorkflowList(
-  workflows: Map<string, WorkflowDefinition>,
+  workflows: Map<string, LoadedWorkflow>,
   width: number,
   theme: ThemeLike,
 ): string[] {
@@ -1899,9 +1888,12 @@ function renderWorkflowList(
     if (def.description) {
       lines.push(`    ${theme.fg("muted", def.description)}`);
     }
-    const phaseNames = def.phases
-      .map((p) => (p.parallel && p.parallel.length > 0 ? `${p.name}⇉` : p.name))
-      .join(theme.fg("dim", " → "));
+    // phases is a display-only hint (a "name⇉" suffix marks a parallel group).
+    // Omitted → the body drives progress dynamically, so we say so.
+    const phaseNames =
+      def.phases && def.phases.length > 0
+        ? def.phases.join(theme.fg("dim", " → "))
+        : theme.fg("dim", "dynamic");
     lines.push(`    ${theme.fg("dim", "phases: ")}${phaseNames}`);
     lines.push("");
   }
@@ -1933,7 +1925,7 @@ async function runWorkflowHeadless(
   input: string,
 ): Promise<never> {
   const workflows = await discoverWorkflows(ctx.cwd).catch(
-    () => new Map<string, WorkflowDefinition>(),
+    () => new Map<string, LoadedWorkflow>(),
   );
   const def = workflows.get(name);
   if (!def) {
@@ -1953,7 +1945,7 @@ async function runWorkflowHeadless(
 
   let state: WorkflowRunState;
   try {
-    state = await executeWorkflow(
+    state = await runImperativeWorkflow(
       def,
       ctx.cwd,
       (updated) => {
@@ -1993,7 +1985,7 @@ export default function (pi: ExtensionAPI) {
     type: "string",
   });
   pi.registerFlag("workflow-input", {
-    description: "Free-text input for --run-workflow (phases read it as ctx.input).",
+    description: "Free-text input for --run-workflow (the workflow reads it as `args`).",
     type: "string",
   });
 
@@ -2003,7 +1995,7 @@ export default function (pi: ExtensionAPI) {
     name: "run_workflow",
     label: "Run Workflow",
     description:
-      "Start a defined .pi/workflows/*.js workflow. Runs in the background and returns immediately; pass `input` to parameterize it (phases read ctx.input). Retrieve a finished run's full output later with get_workflow_result.",
+      "Start a defined .pi/workflows/*.js workflow. Runs in the background and returns immediately; pass `input` to parameterize it (the workflow reads it as `args`). Retrieve a finished run's full output later with get_workflow_result.",
     promptSnippet: "Run a named .pi/workflows/*.js workflow in the background",
     promptGuidelines: [
       "After calling run_workflow, briefly confirm it started and continue — it runs in the background; do not wait for it.",
@@ -2014,7 +2006,7 @@ export default function (pi: ExtensionAPI) {
       input: Type.Optional(
         Type.String({
           description:
-            "Free-text input for the run, available to phases as ctx.input (e.g. the change to scout for, the topic to research). Optional.",
+            "Free-text input for the run, available to the workflow as `args` (e.g. the change to scout for, the topic to research). Optional.",
         }),
       ),
       wait: Type.Optional(
@@ -2099,7 +2091,7 @@ export default function (pi: ExtensionAPI) {
       });
       scheduleRunWrite(registry.get(runId)!.run, meta);
 
-      const state = await executeWorkflow(
+      const state = await runImperativeWorkflow(
         def,
         ctx.cwd,
         (updatedState) => {
@@ -2238,7 +2230,8 @@ export default function (pi: ExtensionAPI) {
       const summaries: string[] = [];
       for (const [name, def] of workflows) {
         const desc = def.description ? `: ${def.description}` : "";
-        const phaseNames = def.phases.map((p) => p.name).join(", ");
+        const phaseNames =
+          def.phases && def.phases.length > 0 ? def.phases.join(", ") : "dynamic";
         summaries.push(`- **${name}**${desc}\n  Phases: ${phaseNames}`);
       }
 
@@ -2427,10 +2420,11 @@ export default function (pi: ExtensionAPI) {
   // ── Command: /workflow <name> ─────────────────────────────────────────
 
   pi.registerCommand("workflow", {
-    description: "Run a workflow in the background: /workflow <name> [input...] (watch with /workflows)",
+    description:
+      "Run a workflow: /workflow <name> [input...] [--wait]. Background by default (watch with /workflows); --wait blocks with live progress, then the result.",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       // Only complete the first token (the name); once a space is typed the
-      // remainder is free-text input and shouldn't be autocompleted.
+      // remainder is free-text input (and the optional --wait flag).
       if (prefix.includes(" ")) return null;
       const items = cachedWorkflowNames
         .filter((n) => n.startsWith(prefix))
@@ -2438,29 +2432,27 @@ export default function (pi: ExtensionAPI) {
       return items.length > 0 ? items : null;
     },
     handler: async (args, ctx) => {
-      const trimmed = args.trim();
-      // First token is the workflow name; the rest is free-text input (ctx.input).
-      const spaceIdx = trimmed.search(/\s/);
-      const name = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
-      const input = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+      // `--wait` is a recognized token (stripped from the name/input wherever it
+      // appears); everything else is the name (first token) then free-text input.
+      const tokens = args.trim().split(/\s+/).filter(Boolean);
+      const wait = tokens.includes("--wait");
+      const rest = tokens.filter((t) => t !== "--wait");
+      const name = rest[0] ?? "";
+      const input = rest.slice(1).join(" ");
 
       const workflows = await discoverWorkflows(ctx.cwd);
 
       if (workflows.size === 0) {
-        ctx.ui.notify(
-          `No workflows found. Add one to .pi/workflows/.${loadErrorsText()}`,
-          "warning",
-        );
+        ctx.ui.notify(`No workflows found. Add one to .pi/workflows/.${loadErrorsText()}`, "warning");
         return;
       }
       if (!name) {
         ctx.ui.notify(
-          `Usage: /workflow <name> [input...]. Available: ${Array.from(workflows.keys()).join(", ")}`,
+          `Usage: /workflow <name> [input...] [--wait]. Available: ${Array.from(workflows.keys()).join(", ")}`,
           "info",
         );
         return;
       }
-
       const def = workflows.get(name);
       if (!def) {
         ctx.ui.notify(
@@ -2470,7 +2462,125 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const runId = startBackgroundRun(def, ctx.cwd, input, ctx.sessionManager?.getSessionId?.());
+      const sessionId = ctx.sessionManager?.getSessionId?.();
+
+      // ── --wait in the TUI: block on a live progress view, then a scrollable
+      //    result. The run is the same background run; we just watch it (so Esc
+      //    can cancel via its abortController) instead of forking away. ──
+      if (wait && ctx.hasUI) {
+        const runId = startBackgroundRun(def, ctx.cwd, input, sessionId, /* announce */ false);
+        let offset = 0;
+        const PAGE = 22;
+        let aborting = false;
+        await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+          const poll = setInterval(() => {
+            const r = findRun(runId);
+            if (r && r.status !== "running") clearInterval(poll);
+            tui.requestRender();
+          }, 700);
+          return {
+            handleInput(data: string) {
+              const run = findRun(runId);
+              const running = !!run && run.status === "running";
+              if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "q")) {
+                if (running && !aborting) {
+                  aborting = true; // first q/Esc while running → cancel; the view stays to show the outcome
+                  registry.get(runId)?.abortController?.abort();
+                  tui.requestRender();
+                } else {
+                  clearInterval(poll);
+                  done();
+                }
+                return;
+              }
+              if (!running) {
+                if (matchesKey(data, "down") || matchesKey(data, "j")) offset += 1;
+                else if (matchesKey(data, "up") || matchesKey(data, "k")) offset -= 1;
+                else if (matchesKey(data, "space") || matchesKey(data, "pageDown")) offset += PAGE;
+                else if (matchesKey(data, "pageUp") || matchesKey(data, "b")) offset -= PAGE;
+                else return;
+                if (offset < 0) offset = 0;
+                tui.requestRender();
+              }
+            },
+            render(width: number): string[] {
+              const run = findRun(runId);
+              if (!run) return [theme.fg("dim", `  run ${runId} not found`)];
+              if (run.status === "running") {
+                const lines = renderWorkflowProgress([run], width, theme);
+                lines.push(theme.fg("dim", aborting ? "  cancelling…" : "  running — q/Esc to cancel"));
+                return lines.map((l) => truncateToWidth(l, width));
+              }
+              // Terminal → scrollable result (same view as /workflow-result).
+              const border = theme.fg("borderMuted", "─".repeat(Math.max(0, width)));
+              const wrapped: string[] = [];
+              for (const line of buildResultLines(run, theme)) {
+                if (line === "") wrapped.push("");
+                else for (const w of wrapTextWithAnsi(line, width)) wrapped.push(w);
+              }
+              const maxOffset = Math.max(0, wrapped.length - PAGE);
+              if (offset > maxOffset) offset = maxOffset;
+              const view = wrapped.slice(offset, offset + PAGE);
+              const more = wrapped.length > PAGE;
+              const pos = more
+                ? `  ${offset + 1}-${Math.min(offset + PAGE, wrapped.length)} / ${wrapped.length}`
+                : "";
+              const hint = more ? "↑/↓ or space scroll · q/Esc close" : "q/Esc close";
+              const out: string[] = [border];
+              out.push(theme.fg("accent", theme.bold(` Workflow: ${run.name} `)) + theme.fg("dim", pos));
+              out.push(border);
+              out.push(...view);
+              for (let i = view.length; i < PAGE; i++) out.push("");
+              out.push(theme.fg("dim", `  ${hint}`));
+              out.push(border);
+              return out.map((l) => truncateToWidth(l, width));
+            },
+            invalidate() {},
+          };
+        });
+        return;
+      }
+
+      // ── --wait without a TUI (RPC / headless): run synchronously and emit a
+      //    terminal marker so the caller learns the outcome + result-file path. ──
+      if (wait) {
+        const abortController = new AbortController();
+        const runId = generateId();
+        const rmeta: RunMeta = { input, cwd: ctx.cwd, sessionId };
+        registry.set(runId, {
+          run: { id: runId, name: def.name, status: "running", phases: {}, startTime: Date.now() },
+          definition: def,
+          abortController,
+        });
+        scheduleRunWrite(registry.get(runId)!.run, rmeta);
+        const state = await runImperativeWorkflow(
+          def,
+          ctx.cwd,
+          (u) => {
+            const e = registry.get(runId);
+            if (e) e.run = u;
+            scheduleRunWrite(u, rmeta);
+          },
+          abortController.signal,
+          runId,
+          input,
+        );
+        writeRunFile(state, rmeta);
+        pi.sendMessage(
+          {
+            customType: "workflow-status",
+            content: `Workflow "${name}" (run ${runId}) ${state.status}.`,
+            display: false,
+            details: { runId, name, status: state.status, file: runFilePath(runId, ctx.cwd), dir: runStoreDir(ctx.cwd) },
+          },
+          { deliverAs: "nextTurn" },
+        );
+        ctx.ui.notify(`Workflow "${name}" ${state.status} (run ${runId}).`, state.status === "failed" ? "error" : "info");
+        return;
+      }
+
+      // ── Background (default) ──
+      const runId = startBackgroundRun(def, ctx.cwd, input, sessionId);
       // Structured, non-waking ack so an RPC frontend learns the run id (and the
       // path to its result file) without an LLM turn — /workflow is the
       // recommended programmatic trigger over RPC. deliverAs:"nextTurn" never

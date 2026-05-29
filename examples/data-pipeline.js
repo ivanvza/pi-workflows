@@ -1,14 +1,15 @@
-/**
- * data-pipeline — discover data sources, propose transformations, validate them.
- */
-
-const dataPipeline = {
+export const meta = {
   name: "data-pipeline",
   description: "Process data through discovery, transformation, and validation",
-  phases: [
+  phases: ["discover", "transform", "validate"],
+};
+
+export default async function ({ agent, phase, log, args }) {
+  phase("Discover");
+  const { sources } = await agent(
+    "Discover all data sources and their formats in the project." +
+      (args ? `\n\nFocus area: ${args}` : ""),
     {
-      name: "discover",
-      prompt: "Discover all data sources and their formats in the project.",
       schema: {
         sources: {
           type: "array",
@@ -24,13 +25,17 @@ const dataPipeline = {
           },
         },
       },
+      label: "discover",
     },
+  );
+  log(`Discovered ${sources.length} data source(s)`);
+
+  phase("Transform");
+  const { transformations } = await agent(
+    "Propose transformations to normalize these data sources (format conversion, schema " +
+      "alignment, cleaning):\n\n" +
+      JSON.stringify(sources),
     {
-      name: "transform",
-      prompt: (ctx) =>
-        "Propose transformations to normalize these data sources (format conversion, schema " +
-        "alignment, cleaning):\n\n" +
-        JSON.stringify(ctx.previous.discover.sources),
       schema: {
         transformations: {
           type: "array",
@@ -42,20 +47,23 @@ const dataPipeline = {
           },
         },
       },
+      label: "transform",
     },
+  );
+
+  phase("Validate");
+  const validation = await agent(
+    "Review these proposed transformations for data-integrity risks; confirm no data loss " +
+      "and that edge cases are handled:\n\n" +
+      JSON.stringify(transformations),
     {
-      name: "validate",
-      prompt: (ctx) =>
-        "Review these proposed transformations for data-integrity risks; confirm no data loss " +
-        "and that edge cases are handled:\n\n" +
-        JSON.stringify(ctx.previous.transform.transformations),
       schema: {
         valid: "boolean!",
         risks: "string[]",
         recommendations: "string[]",
       },
+      label: "validate",
     },
-  ],
-};
-
-export { dataPipeline };
+  );
+  return validation;
+}

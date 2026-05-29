@@ -3,51 +3,62 @@
  *
  * Optional input narrows the review, e.g.
  *   /workflow code-review focus on the auth module
- * available to phases as `ctx.input`.
+ * It arrives as `args`.
+ *
+ * Shows the whole imperative toolkit: phase() grouping, a named agent persona,
+ * structured schemas, retries, parallel() fan-out, a deterministic native-JS
+ * transform between models (no tokens), a budget hint, and returning the
+ * deliverable. Control flow is plain JS — there are no special phase fields.
  */
 
-const codeReview = {
+export const meta = {
   name: "code-review",
   description: "Comprehensive code review: analysis, parallel checks, synthesis, report",
-  phases: [
+  // Display-only flow hint for /workflow-list (⇉ marks the parallel group).
+  phases: ["analyze", "checks⇉", "review", "report"],
+};
+
+export default async function ({ agent, parallel, phase, log, args }) {
+  // ── Analyze: a fast scout persona, retried, returns structure ────────────
+  phase("Analyze");
+  const analysis = await agent(
+    "Analyze the codebase structure: key source files, their relationships, and the " +
+      "overall architecture pattern." +
+      (args ? `\n\nFocus area: ${args}` : ""),
     {
-      name: "analyze",
       agent: "scout",
-      prompt: (ctx) =>
-        "Analyze the codebase structure: key source files, their relationships, and the " +
-        "overall architecture pattern." +
-        (ctx.input ? `\n\nFocus area: ${ctx.input}` : ""),
-      schema: {
-        files: "string[]!",
-        architecture: "string",
-        modules: "string[]",
-      },
+      schema: { files: "string[]!", architecture: "string", modules: "string[]" },
       retries: 2,
+      label: "analyze",
     },
-    {
-      name: "parallel-checks",
-      parallel: [
-        {
-          name: "lint-issues",
-          prompt: "Scan for linting issues, style violations, and code-quality problems.",
-          schema: {
-            issues: {
-              type: "array",
-              description: "Lint / quality issues found",
-              items: {
-                type: "object",
-                description: "An issue",
-                properties: { file: "string", line: "number", description: "string" },
-              },
+  );
+  log(`Analyzed ${analysis.files.length} source files`);
+
+  // ── Parallel checks: three independent audits at once (barrier) ──────────
+  phase("Checks");
+  const [lint, security, tests] = await parallel([
+    () =>
+      agent("Scan for linting issues, style violations, and code-quality problems.", {
+        label: "lint",
+        schema: {
+          issues: {
+            type: "array",
+            description: "Lint / quality issues found",
+            items: {
+              type: "object",
+              description: "An issue",
+              properties: { file: "string", line: "number", description: "string" },
             },
-            summary: "string",
           },
+          summary: "string",
         },
+      }),
+    () =>
+      agent(
+        "Audit for security vulnerabilities: injection risks, hardcoded secrets, unsafe " +
+          "dependencies, missing input validation, insecure configuration.",
         {
-          name: "security-audit",
-          prompt:
-            "Audit for security vulnerabilities: injection risks, hardcoded secrets, unsafe " +
-            "dependencies, missing input validation, insecure configuration.",
+          label: "security",
           schema: {
             vulnerabilities: {
               type: "array",
@@ -66,32 +77,32 @@ const codeReview = {
             riskLevel: "string", // high | medium | low
           },
         },
-        {
-          name: "test-coverage",
-          prompt:
-            "Assess testing: what test files exist, which frameworks are used, what lacks coverage.",
-          schema: {
-            framework: "string", // or "none"
-            testFiles: "string[]",
-            uncoveredAreas: "string[]",
-          },
-        },
-      ],
-    },
+      ),
+    () =>
+      agent("Assess testing: which test files exist, frameworks used, and what lacks coverage.", {
+        label: "tests",
+        schema: { framework: "string", testFiles: "string[]", uncoveredAreas: "string[]" },
+      }),
+  ]);
+
+  // ── Deterministic transform (native JS — no model, no tokens) ────────────
+  // Order vulnerabilities by severity so the synthesis prompt leads with the worst.
+  const RANK = { high: 0, medium: 1, low: 2 };
+  const vulns = (security?.vulnerabilities ?? [])
+    .slice()
+    .sort((a, b) => (RANK[a.severity] ?? 9) - (RANK[b.severity] ?? 9));
+
+  // ── Synthesize: a heavier reviewer persona with a budget hint ────────────
+  phase("Review");
+  const review = await agent(
+    "Synthesize a comprehensive code review from these findings.\n\n" +
+      `Architecture: ${JSON.stringify(analysis)}\n` +
+      `Lint: ${JSON.stringify(lint)}\n` +
+      `Security (worst first): ${JSON.stringify(vulns)}\n` +
+      `Tests: ${JSON.stringify(tests)}\n\n` +
+      "Provide an executive summary, prioritized recommendations with severity, and a 1-10 health score.",
     {
-      name: "review",
       agent: "reviewer",
-      prompt: (ctx) => {
-        const c = ctx.previous["parallel-checks"]; // { lint-issues, security-audit, test-coverage }
-        return (
-          "Synthesize a comprehensive code review from these findings.\n\n" +
-          `Architecture: ${JSON.stringify(ctx.previous.analyze)}\n` +
-          `Lint: ${JSON.stringify(c["lint-issues"])}\n` +
-          `Security: ${JSON.stringify(c["security-audit"])}\n` +
-          `Tests: ${JSON.stringify(c["test-coverage"])}\n\n` +
-          "Provide an executive summary, prioritized recommendations with severity, and a 1-10 health score."
-        );
-      },
       schema: {
         executiveSummary: "string!",
         recommendations: {
@@ -111,16 +122,18 @@ const codeReview = {
         healthScore: "number",
       },
       budget: { maxTokens: 50000 },
+      label: "review",
     },
-    {
-      name: "report",
-      prompt: (ctx) =>
-        "Write a polished markdown report of the review below. Sections: architecture, issues, " +
-        "recommendations, and health score. Output the full report as the `markdown` field.\n\n" +
-        JSON.stringify(ctx.previous.review),
-      schema: { markdown: "string!" },
-    },
-  ],
-};
+  );
 
-export { codeReview };
+  // ── Report: the returned value is the run's deliverable ──────────────────
+  phase("Report");
+  const report = await agent(
+    "Write a polished markdown report of the review below. Sections: architecture, issues, " +
+      "recommendations, and health score. Output the full report as the `markdown` field.\n\n" +
+      JSON.stringify(review),
+    { schema: { markdown: "string!" }, tools: [], label: "report" },
+  );
+
+  return report.markdown;
+}
