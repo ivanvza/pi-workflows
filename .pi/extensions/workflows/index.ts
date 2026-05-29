@@ -788,7 +788,6 @@ class ProgressRecorder {
       status: "running",
       attempts: 1,
     };
-    this.state.currentPhase = this.group || base;
     this.emit();
     return key;
   }
@@ -802,29 +801,26 @@ class ProgressRecorder {
     }
   }
 
+  // finishStep/failStep mutate the entry startStep() already created (it always
+  // runs first), preserving its phaseName (and finishStep its attempts).
   finishStep(key: string, output: any, usage: Usage, duration: number): void {
-    const prev = this.state.phases[key];
-    this.state.phases[key] = {
-      phaseName: prev?.phaseName ?? key,
-      status: "completed",
-      output,
-      usage,
-      duration,
-      attempts: prev?.attempts ?? 1,
-    };
+    const pr = this.state.phases[key];
+    if (!pr) return;
+    pr.status = "completed";
+    pr.output = output;
+    pr.usage = usage;
+    pr.duration = duration;
     this.emit();
   }
 
   failStep(key: string, error: string, usage: Usage, duration: number, attempts: number): void {
-    const prev = this.state.phases[key];
-    this.state.phases[key] = {
-      phaseName: prev?.phaseName ?? key,
-      status: "failed",
-      error,
-      usage,
-      duration,
-      attempts,
-    };
+    const pr = this.state.phases[key];
+    if (!pr) return;
+    pr.status = "failed";
+    pr.error = error;
+    pr.usage = usage;
+    pr.duration = duration;
+    pr.attempts = attempts;
     this.emit();
   }
 }
@@ -1026,18 +1022,11 @@ async function runImperativeWorkflow(
 
   try {
     const returned = await loaded.fn(runtime);
-    // The return value is the deliverable. If the body returned nothing, fall
-    // back to the last completed step's output so trivial bodies still surface a
-    // result. Save it BEFORE checking the abort signal so a run that finished
-    // just as it was cancelled doesn't silently lose its output.
-    let deliverable = returned;
-    if (deliverable === undefined) {
-      const completed = Object.values(state.phases).filter(
-        (p) => p.status === "completed" && p.output != null,
-      );
-      deliverable = completed.length ? completed[completed.length - 1].output : undefined;
-    }
-    state.result = deliverable;
+    // The return value is the deliverable; if the body returned nothing, fall back
+    // to the last completed step's output (resolveDeliverable owns that rule).
+    // Resolve BEFORE checking the abort signal so a run that finished just as it
+    // was cancelled doesn't silently lose its output.
+    state.result = returned !== undefined ? returned : resolveDeliverable(state);
     state.status = signal?.aborted ? "cancelled" : "completed";
   } catch (err: any) {
     state.status = signal?.aborted ? "cancelled" : "failed";
@@ -1565,6 +1554,45 @@ function loadErrorsText(): string {
   return `\n\n${workflowLoadErrors.length} workflow file(s) failed to load:\n${lines.join("\n")}`;
 }
 
+/** Register a run, drive it to completion SYNCHRONOUSLY (awaited), and persist it
+ *  — the shared core behind the `run_workflow` wait path, `/workflow --wait` over
+ *  RPC, and the `--run-workflow` headless flag. Keeps the registry in sync and
+ *  writes the run store on every progress tick (throttled) plus a final flush;
+ *  `onProgress` is an optional extra hook (e.g. to stream to a tool's onUpdate).
+ *  Returns the run id and the terminal state. */
+async function runRegistered(
+  def: LoadedWorkflow,
+  cwd: string,
+  input: string,
+  sessionId: string | undefined,
+  abortController: AbortController,
+  onProgress?: (state: WorkflowRunState) => void,
+): Promise<{ runId: string; state: WorkflowRunState }> {
+  const runId = generateId();
+  const meta: RunMeta = { input, cwd, sessionId };
+  registry.set(runId, {
+    run: { id: runId, name: def.name, status: "running", phases: {}, startTime: Date.now() },
+    definition: def,
+    abortController,
+  });
+  scheduleRunWrite(registry.get(runId)!.run, meta);
+  const state = await runImperativeWorkflow(
+    def,
+    cwd,
+    (u) => {
+      const e = registry.get(runId);
+      if (e) e.run = u;
+      scheduleRunWrite(u, meta);
+      onProgress?.(u);
+    },
+    abortController.signal,
+    runId,
+    input,
+  );
+  writeRunFile(state, meta); // synchronous force-write of the terminal state
+  return { runId, state };
+}
+
 /** Start a workflow in the background: register it, persist it to the run store
  *  (so /workflows, /workflow-result, get_workflow_result, and EXTERNAL readers
  *  can track it), and run it detached.
@@ -1733,6 +1761,60 @@ function buildResultLines(state: WorkflowRunState, theme: ThemeLike): string[] {
     lines.push("");
   }
   return lines;
+}
+
+// ── Scrollable result viewer (shared by /workflow-result and /workflow --wait) ──
+
+/** Visible content rows in the scrollable result viewer. */
+const RESULT_PAGE = 22;
+
+/** Wrap a run's full result (buildResultLines) to `width`, preserving blank-line
+ *  spacing. Pure + width-dependent, so callers cache it per (run, width) instead
+ *  of re-wrapping on every repaint. */
+function wrapResultLines(state: WorkflowRunState, theme: ThemeLike, width: number): string[] {
+  const wrapped: string[] = [];
+  for (const line of buildResultLines(state, theme)) {
+    if (line === "") wrapped.push("");
+    else for (const w of wrapTextWithAnsi(line, width)) wrapped.push(w);
+  }
+  return wrapped;
+}
+
+/** New scroll offset for a key event, or null if `data` isn't a scroll key. */
+function scrollResultOffset(data: string, offset: number): number | null {
+  let next = offset;
+  if (matchesKey(data, "down") || matchesKey(data, "j")) next += 1;
+  else if (matchesKey(data, "up") || matchesKey(data, "k")) next -= 1;
+  else if (matchesKey(data, "space") || matchesKey(data, "pageDown")) next += RESULT_PAGE;
+  else if (matchesKey(data, "pageUp") || matchesKey(data, "b")) next -= RESULT_PAGE;
+  else return null;
+  return next < 0 ? 0 : next;
+}
+
+/** Render the bordered, paged result frame from pre-wrapped lines. `offset` must
+ *  already be clamped to [0, maxOffset]. */
+function renderResultFrame(
+  wrapped: string[],
+  offset: number,
+  width: number,
+  theme: ThemeLike,
+  title: string,
+): string[] {
+  const border = theme.fg("borderMuted", "─".repeat(Math.max(0, width)));
+  const view = wrapped.slice(offset, offset + RESULT_PAGE);
+  const more = wrapped.length > RESULT_PAGE;
+  const pos = more
+    ? `  ${offset + 1}-${Math.min(offset + RESULT_PAGE, wrapped.length)} / ${wrapped.length}`
+    : "";
+  const hint = more ? "↑/↓ or space scroll · q/Esc close" : "q/Esc close";
+  const out: string[] = [border];
+  out.push(theme.fg("accent", theme.bold(` ${title} `)) + theme.fg("dim", pos));
+  out.push(border);
+  out.push(...view);
+  for (let i = view.length; i < RESULT_PAGE; i++) out.push("");
+  out.push(theme.fg("dim", `  ${hint}`));
+  out.push(border);
+  return out.map((l) => truncateToWidth(l, width));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1934,40 +2016,15 @@ async function runWorkflowHeadless(
     return process.exit(2);
   }
 
-  const runId = generateId();
-  const meta: RunMeta = { input, cwd: ctx.cwd, sessionId: ctx.sessionManager?.getSessionId?.() };
-  registry.set(runId, {
-    run: { id: runId, name: def.name, status: "running", phases: {}, startTime: Date.now() },
-    definition: def,
-    abortController: new AbortController(),
-  });
-  scheduleRunWrite(registry.get(runId)!.run, meta);
-
-  let state: WorkflowRunState;
-  try {
-    state = await runImperativeWorkflow(
-      def,
-      ctx.cwd,
-      (updated) => {
-        const e = registry.get(runId);
-        if (e) e.run = updated;
-        scheduleRunWrite(updated, meta);
-      },
-      undefined,
-      runId,
-      input,
-    );
-  } catch (err: any) {
-    const e = registry.get(runId);
-    state = e?.run ?? { id: runId, name: def.name, status: "failed", phases: {}, startTime: Date.now() };
-    state.status = "failed";
-    state.error = err?.message || String(err);
-    state.endTime = Date.now();
-  }
-
-  writeRunFile(state, meta); // synchronous force-write before we exit
-  // Final stdout line = the deliverable's path; the spawning process reads the
-  // full PersistedRun JSON (status + per-phase output) from it, like a result file.
+  const { runId, state } = await runRegistered(
+    def,
+    ctx.cwd,
+    input,
+    ctx.sessionManager?.getSessionId?.(),
+    new AbortController(),
+  );
+  // Final stdout line = the run file's path; the spawning process reads the full
+  // PersistedRun JSON (status + per-step output) from it, like a result file.
   process.stdout.write(`${runFilePath(runId, ctx.cwd)}\n`);
   return process.exit(state.status === "completed" ? 0 : 1);
 }
@@ -2075,62 +2132,30 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Synchronous execution with progress streaming. Register + persist it too
-      // (with a real run id) so it is addressable and survives like background runs.
+      // Synchronous execution with progress streaming, via the shared run helper.
+      // Link the tool's abort signal so cancelling the call cancels the run.
       const abortController = new AbortController();
       if (signal) {
         signal.addEventListener("abort", () => abortController.abort(), { once: true });
       }
 
-      const runId = generateId();
-      const meta: RunMeta = { input, cwd: ctx.cwd, sessionId };
-      registry.set(runId, {
-        run: { id: runId, name: def.name, status: "running", phases: {}, startTime: Date.now() },
-        definition: def,
-        abortController,
+      const { state } = await runRegistered(def, ctx.cwd, input, sessionId, abortController, (updatedState) => {
+        // Stream progress to the LLM as a compact step summary.
+        const summary = Object.entries(updatedState.phases)
+          .map(([name, pr]) => {
+            const icon =
+              pr.status === "completed" ? "✓" :
+              pr.status === "running" ? "●" :
+              pr.status === "failed" ? "✗" :
+              pr.status === "skipped" ? "→" : "○";
+            return `  ${icon} ${name}: ${pr.status}`;
+          })
+          .join("\n");
+        onUpdate?.({
+          content: [{ type: "text", text: `Workflow "${updatedState.name}" [${updatedState.status}]\n${summary}` }],
+          details: updatedState,
+        });
       });
-      scheduleRunWrite(registry.get(runId)!.run, meta);
-
-      const state = await runImperativeWorkflow(
-        def,
-        ctx.cwd,
-        (updatedState) => {
-          const entry = registry.get(runId);
-          if (entry) entry.run = updatedState;
-          scheduleRunWrite(updatedState, meta);
-
-          // Stream progress to the LLM
-          const phaseEntries = Object.entries(updatedState.phases);
-          const summary = phaseEntries
-            .map(([name, pr]) => {
-              const icon =
-                pr.status === "completed" ? "✓" :
-                pr.status === "running" ? "●" :
-                pr.status === "failed" ? "✗" :
-                pr.status === "skipped" ? "→" : "○";
-              return `  ${icon} ${name}: ${pr.status}`;
-            })
-            .join("\n");
-
-          onUpdate?.({
-            content: [
-              {
-                type: "text",
-                text: `Workflow "${updatedState.name}" [${updatedState.status}]\n${summary}`,
-              },
-            ],
-            details: updatedState,
-          });
-        },
-        abortController.signal,
-        runId,
-        input,
-      );
-
-      // Guarantee a final on-disk write + registry sync.
-      const syncEntry = registry.get(runId);
-      if (syncEntry) syncEntry.run = state;
-      writeRunFile(state, meta);
 
       // Format final result
       if (state.status === "failed") {
@@ -2470,8 +2495,11 @@ export default function (pi: ExtensionAPI) {
       if (wait && ctx.hasUI) {
         const runId = startBackgroundRun(def, ctx.cwd, input, sessionId, /* announce */ false);
         let offset = 0;
-        const PAGE = 22;
         let aborting = false;
+        // Cache the wrapped result once the run is terminal (rebuild only on a
+        // width change) so scrolling doesn't re-serialize the deliverable.
+        let wrapped: string[] | null = null;
+        let wrappedWidth = -1;
         await ctx.ui.custom<void>((tui, theme, _kb, done) => {
           const poll = setInterval(() => {
             const r = findRun(runId);
@@ -2494,12 +2522,9 @@ export default function (pi: ExtensionAPI) {
                 return;
               }
               if (!running) {
-                if (matchesKey(data, "down") || matchesKey(data, "j")) offset += 1;
-                else if (matchesKey(data, "up") || matchesKey(data, "k")) offset -= 1;
-                else if (matchesKey(data, "space") || matchesKey(data, "pageDown")) offset += PAGE;
-                else if (matchesKey(data, "pageUp") || matchesKey(data, "b")) offset -= PAGE;
-                else return;
-                if (offset < 0) offset = 0;
+                const next = scrollResultOffset(data, offset);
+                if (next === null) return;
+                offset = next;
                 tui.requestRender();
               }
             },
@@ -2511,29 +2536,14 @@ export default function (pi: ExtensionAPI) {
                 lines.push(theme.fg("dim", aborting ? "  cancelling…" : "  running — q/Esc to cancel"));
                 return lines.map((l) => truncateToWidth(l, width));
               }
-              // Terminal → scrollable result (same view as /workflow-result).
-              const border = theme.fg("borderMuted", "─".repeat(Math.max(0, width)));
-              const wrapped: string[] = [];
-              for (const line of buildResultLines(run, theme)) {
-                if (line === "") wrapped.push("");
-                else for (const w of wrapTextWithAnsi(line, width)) wrapped.push(w);
+              // Terminal → same scrollable result view as /workflow-result.
+              if (!wrapped || wrappedWidth !== width) {
+                wrapped = wrapResultLines(run, theme, width);
+                wrappedWidth = width;
               }
-              const maxOffset = Math.max(0, wrapped.length - PAGE);
+              const maxOffset = Math.max(0, wrapped.length - RESULT_PAGE);
               if (offset > maxOffset) offset = maxOffset;
-              const view = wrapped.slice(offset, offset + PAGE);
-              const more = wrapped.length > PAGE;
-              const pos = more
-                ? `  ${offset + 1}-${Math.min(offset + PAGE, wrapped.length)} / ${wrapped.length}`
-                : "";
-              const hint = more ? "↑/↓ or space scroll · q/Esc close" : "q/Esc close";
-              const out: string[] = [border];
-              out.push(theme.fg("accent", theme.bold(` Workflow: ${run.name} `)) + theme.fg("dim", pos));
-              out.push(border);
-              out.push(...view);
-              for (let i = view.length; i < PAGE; i++) out.push("");
-              out.push(theme.fg("dim", `  ${hint}`));
-              out.push(border);
-              return out.map((l) => truncateToWidth(l, width));
+              return renderResultFrame(wrapped, offset, width, theme, `Workflow: ${run.name}`);
             },
             invalidate() {},
           };
@@ -2544,28 +2554,7 @@ export default function (pi: ExtensionAPI) {
       // ── --wait without a TUI (RPC / headless): run synchronously and emit a
       //    terminal marker so the caller learns the outcome + result-file path. ──
       if (wait) {
-        const abortController = new AbortController();
-        const runId = generateId();
-        const rmeta: RunMeta = { input, cwd: ctx.cwd, sessionId };
-        registry.set(runId, {
-          run: { id: runId, name: def.name, status: "running", phases: {}, startTime: Date.now() },
-          definition: def,
-          abortController,
-        });
-        scheduleRunWrite(registry.get(runId)!.run, rmeta);
-        const state = await runImperativeWorkflow(
-          def,
-          ctx.cwd,
-          (u) => {
-            const e = registry.get(runId);
-            if (e) e.run = u;
-            scheduleRunWrite(u, rmeta);
-          },
-          abortController.signal,
-          runId,
-          input,
-        );
-        writeRunFile(state, rmeta);
+        const { runId, state } = await runRegistered(def, ctx.cwd, input, sessionId, new AbortController());
         pi.sendMessage(
           {
             customType: "workflow-status",
@@ -2659,51 +2648,28 @@ export default function (pi: ExtensionAPI) {
 
       await ctx.ui.custom<void>((tui, theme, _kb, done) => {
         let offset = 0;
-        const PAGE = 22; // visible content rows
-
+        // `run` is terminal/immutable here, so wrap once per width.
+        let wrapped: string[] | null = null;
+        let wrappedWidth = -1;
         return {
           handleInput(data: string) {
             if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "q")) {
               done();
               return;
             }
-            if (matchesKey(data, "down") || matchesKey(data, "j")) offset += 1;
-            else if (matchesKey(data, "up") || matchesKey(data, "k")) offset -= 1;
-            else if (matchesKey(data, "space") || matchesKey(data, "pageDown")) offset += PAGE;
-            else if (matchesKey(data, "pageUp") || matchesKey(data, "b")) offset -= PAGE;
-            else return;
-            if (offset < 0) offset = 0;
+            const next = scrollResultOffset(data, offset);
+            if (next === null) return;
+            offset = next;
             tui.requestRender();
           },
           render(width: number): string[] {
-            const border = theme.fg("borderMuted", "─".repeat(Math.max(0, width)));
-            // Wrap full result content to the available width.
-            const wrapped: string[] = [];
-            for (const line of buildResultLines(run, theme)) {
-              if (line === "") wrapped.push("");
-              else for (const w of wrapTextWithAnsi(line, width)) wrapped.push(w);
+            if (!wrapped || wrappedWidth !== width) {
+              wrapped = wrapResultLines(run, theme, width);
+              wrappedWidth = width;
             }
-            const maxOffset = Math.max(0, wrapped.length - PAGE);
+            const maxOffset = Math.max(0, wrapped.length - RESULT_PAGE);
             if (offset > maxOffset) offset = maxOffset;
-            const view = wrapped.slice(offset, offset + PAGE);
-
-            const more = wrapped.length > PAGE;
-            const pos = more
-              ? `  ${offset + 1}-${Math.min(offset + PAGE, wrapped.length)} / ${wrapped.length}`
-              : "";
-            const hint = more ? "↑/↓ or space scroll · q/Esc close" : "q/Esc close";
-
-            const out: string[] = [];
-            out.push(border);
-            const title = theme.fg("accent", theme.bold(" Workflow Result "));
-            out.push(title + theme.fg("dim", pos));
-            out.push(border);
-            out.push(...view);
-            // Pad so the footer stays put on short content.
-            for (let i = view.length; i < PAGE; i++) out.push("");
-            out.push(theme.fg("dim", `  ${hint}`));
-            out.push(border);
-            return out.map((l) => truncateToWidth(l, width));
+            return renderResultFrame(wrapped, offset, width, theme, "Workflow Result");
           },
           invalidate() {},
         };
