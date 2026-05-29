@@ -176,3 +176,41 @@ export interface WorkflowRunState {
   endTime?: number;
   error?: string;
 }
+
+/**
+ * The on-disk form of a run, written one file per run to the run store
+ * (`<project>/.pi/workflow-runs/<id>.json`, overridable via
+ * `PI_WORKFLOWS_RUN_DIR`). It is a superset of {@link WorkflowRunState} plus
+ * provenance so an external process — e.g. a frontend or orchestrator driving
+ * pi over RPC — can list, watch, and read runs without touching pi's in-memory
+ * state. Files are written atomically (write `*.json.tmp` then rename), so a
+ * reader never observes a half-written file.
+ *
+ * `status` adds `"interrupted"`: a run whose owning process exited before it
+ * reached a terminal state (detected on startup; see rehydrateRuns). It maps
+ * back to a live `status: "failed"` when loaded into the in-memory registry.
+ */
+export interface PersistedRun {
+  /** Bumped when this on-disk shape changes, so future readers can adapt. */
+  schemaVersion: number;
+  id: string;
+  name: string;
+  status: WorkflowRunState["status"] | "interrupted";
+  phases: Record<string, PhaseResult>;
+  currentPhase?: string;
+  startTime: number;
+  endTime?: number;
+  error?: string;
+  /** The run's free-text input (run_workflow's `input` / `/workflow` args). */
+  input: string;
+  /** Working directory the run was launched from. */
+  cwd: string;
+  /** PID of the pi process that launched the run (for dead-owner detection). */
+  pid: number;
+  /** Session id at launch, if the host provided one (for optional filtering). */
+  sessionId?: string;
+  /** Denormalized token/cost/turn totals, so readers needn't re-sum phases. */
+  usage: NonNullable<PhaseResult["usage"]>;
+  /** Date.now() of the last write — used for throttling, sorting, and debug. */
+  updatedAt: number;
+}

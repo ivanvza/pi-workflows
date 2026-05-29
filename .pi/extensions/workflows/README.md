@@ -23,6 +23,7 @@ use models for what models are good at → judgment (the actual work of each ste
 - [Recipes & edge cases](#recipes--edge-cases)
 - [Gotchas](#gotchas)
 - [Running workflows](#running-workflows)
+- [Programmatic / RPC integration](#programmatic--rpc-integration)
 
 ---
 
@@ -428,8 +429,12 @@ yet. Use them to nudge brevity; don't rely on them as a hard stop:
   retry. A prose-only answer falls back to JSON-block parsing. Keep schemas small
   and field descriptions sharp.
 - **Budgets are advisory** (see recipe 9).
-- **Run state is in-memory.** Results are available for the session but cleared on
-  `/reload` or exit.
+- **Runs are persisted to disk**, one JSON file per run, under
+  `.pi/workflow-runs/<id>.json` (override the directory with
+  `$PI_WORKFLOWS_RUN_DIR`). They survive `/reload`, are addressable by run id,
+  and are readable by an external process — see
+  [Programmatic / RPC integration](#programmatic--rpc-integration). The
+  in-memory registry is just a hot cache over this store.
 - **Phases can't recurse into workflows.** Each sub-agent loads no extensions, so
   `run_workflow` isn't available inside a phase. Unrestricted phases still get the
   default mutating built-ins (read, bash, edit, write) — set `tools: ["read"]` for
@@ -448,14 +453,102 @@ yet. Use them to nudge brevity; don't rely on them as a hard stop:
 | Command / tool | What it does |
 | --- | --- |
 | `/workflow-list` | List workflows found in `.pi/workflows/` and any load errors |
-| `/workflow <name> [input…]` | Start a workflow in the background (Tab-completes names); trailing text becomes `ctx.input` |
-| `/workflows` | Live progress of all runs (phase status, timings, token usage) |
-| `/workflow-result [name]` | Scroll the full output of a finished run (no context cost) |
-| `run_workflow` (tool) | The agent starts a workflow — background by default; takes `name` + optional `input` |
-| `get_workflow_result` (tool) | The agent pulls a finished run's output into context on demand |
+| `/workflow <name> [input…]` | Start a workflow in the background (Tab-completes names); trailing text becomes `ctx.input`. Prints the run id |
+| `/workflows` | Live progress of all runs (run id, phase status, timings, token usage) |
+| `/workflow-result [id\|name]` | Scroll the full output of a finished run (no context cost). With no argument and several finished runs, prompts you to pick one |
+| `run_workflow` (tool) | The agent starts a workflow — background by default; takes `name` + optional `input`. Returns the run id + result-file path |
+| `get_workflow_result` (tool) | The agent pulls a finished run's output into context on demand; resolve by run id or name |
 
 Workflows run in the **background by default**, so the main agent stays free. On
-completion you get a toast **and** the agent is nudged (a `followUp` message) to
-announce that the run finished and how to view it — without interrupting whatever
-it's currently doing. The full result waits in the registry until you view it with
-`/workflow-result` or ask the agent to fetch it — keeping the main context clean.
+completion the agent is **not** woken: a passive toast appears and the run's JSON
+file is written with its terminal state. That file is the authoritative result;
+the agent reports it only when you ask (it calls `get_workflow_result`). A
+structured, non-waking marker (`deliverAs: "nextTurn"`) also carries the run id +
+file path on the message stream for programmatic consumers. Nothing enters the
+main context window until you view it with `/workflow-result` or ask the agent to
+fetch it.
+
+## Programmatic / RPC integration
+
+The extension is built to be driven as a component of a larger system — e.g. a
+frontend or orchestrator talking to pi over **RPC mode** (`pi --mode rpc`, a
+JSONL/stdio JSON-RPC stream). Because an external process cannot see pi's
+in-memory state, the **on-disk run store is the integration contract**.
+
+**Where runs live.** One JSON file per run:
+
+```
+<project>/.pi/workflow-runs/<runId>.json
+```
+
+The directory is resolved from (1) `$PI_WORKFLOWS_RUN_DIR` if set, else (2) the
+nearest `.pi/workflow-runs`, else (3) `<cwd>/.pi/workflow-runs`. Files are
+written **atomically** (write `*.json.tmp`, then rename), so a reader never sees
+a half-written file — safe to `fs.watch` the directory and read any `<id>.json`
+on change.
+
+**Run file schema** (`PersistedRun`):
+
+| Field | Meaning |
+| --- | --- |
+| `schemaVersion` | On-disk format version (currently `1`) |
+| `id` | Run id (`wf_…`) — also the filename |
+| `name` | Workflow name |
+| `status` | `running` · `completed` · `failed` · `cancelled` · `interrupted` |
+| `phases` | Per-phase `{ status, output, error, usage, duration, attempts }` — outputs in full |
+| `currentPhase` | Phase currently executing (while `running`) |
+| `startTime` / `endTime` / `updatedAt` | Epoch ms |
+| `error` | Failure / interruption message |
+| `input` | The run's free-text input |
+| `cwd` / `pid` / `sessionId` | Provenance (launch dir, owning process, session) |
+| `usage` | Denormalized token / cost / turn totals |
+
+`interrupted` marks a run whose owning process exited before it finished
+(detected and rewritten on the next startup).
+
+**Trigger a run** (no LLM turn): send the `/workflow` command as a `prompt`.
+
+```json
+{ "type": "prompt", "message": "/workflow my-flow some input text" }
+```
+
+The command handler runs immediately and does **not** start an LLM turn. It
+emits a non-waking `workflow-status` custom message whose `details` carry
+`{ runId, name, status, file, dir }`, so a client reading the message stream
+learns the run id and result path. (Driving via the `run_workflow` *tool*
+instead requires the LLM to choose the tool — use the command for deterministic
+triggering.)
+
+**Trigger synchronously from the command line** (no RPC lifecycle to manage):
+
+```bash
+pi --mode rpc --no-session --run-workflow my-flow --workflow-input "some input text"
+```
+
+The `--run-workflow <name>` flag (with optional `--workflow-input "<text>"`) runs
+the workflow **to completion**, writes its run file, prints that file's absolute
+path as the final stdout line, and exits — `0` completed, `1` failed, `2` unknown
+workflow. This is the agent-free, synchronous peer of the `run_workflow` tool,
+purpose-built for an orchestrator that spawns pi as a subprocess and reads back a
+result file. Launch it in a non-interactive mode (`--mode rpc` or print) so the
+process doesn't try to open a TUI; `--no-session` skips writing a session file.
+
+> **The three front doors share one engine + run store:** the `run_workflow`
+> **tool** (agent), the `/workflow` **command** (user / RPC `prompt`), and the
+> `--run-workflow` **flag** (headless CLI) all call the same executor and write
+> the same `.pi/workflow-runs/<id>.json`. `input` / trailing text /
+> `--workflow-input` are the same value (phases read it as `ctx.input`), so a run
+> is identical downstream no matter who fired it.
+
+**Observe progress.** Watch the run-store directory; each phase transition
+rewrites the run file (throttled, with a guaranteed final write on the terminal
+state). The `/workflows` and `/workflow-result` commands also emit machine-readable
+summaries (a one-line `notify` plus a structured `workflow-status` marker) when
+there is no interactive TUI, instead of erroring.
+
+**Fetch the result.** Read `<id>.json` directly for the full, untruncated
+output, or have the agent call `get_workflow_result({ name: "<runId>" })`.
+
+**Retention.** On startup the store is pruned to the newest ~50 runs and drops
+runs older than ~14 days (running runs with a live owner and very recent runs are
+never pruned; the count pruned is reported). Orphaned `*.json.tmp` files are swept.

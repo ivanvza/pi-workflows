@@ -50,6 +50,7 @@ import { Type } from "typebox";
 import type {
   BudgetConfig,
   FieldSpec,
+  PersistedRun,
   PhaseContext,
   PhaseDefinition,
   PhaseResult,
@@ -159,6 +160,18 @@ function formatUsage(u: Usage): string {
   if (u.cost > 0) parts.push(`$${u.cost.toFixed(3)}`);
   if (u.turns > 0) parts.push(`${u.turns} turns`);
   return parts.join(" · ");
+}
+
+/** Compact "time since" label for a run (since it ended, else since it started),
+ *  e.g. "12s ago", "4m ago", "2h ago", "3d ago". Used in the run picker. */
+function ageStr(run: WorkflowRunState): string {
+  const s = Math.max(0, Math.round((Date.now() - (run.endTime ?? run.startTime)) / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1112,24 +1125,329 @@ const registry = new Map<string, WorkflowRegistryEntry>();
  *  with no ctx of their own) can still reach ctx.ui for notifications. */
 let currentCtx: ExtensionContext | null = null;
 
-/** The ExtensionAPI, captured at load, so background callbacks can nudge the
- *  agent (pi.sendMessage) when a workflow finishes. */
+/** The ExtensionAPI, captured at load, so background callbacks can emit a
+ *  structured, non-waking completion marker (pi.sendMessage, deliverAs:
+ *  "nextTurn") when a workflow finishes — without waking the agent. */
 let extensionApi: ExtensionAPI | null = null;
 
+/** The cwd used to resolve the on-disk run store. Set on session_start /
+ *  turn_start; falls back to process.cwd() before the first event so the
+ *  synchronous store reads in getRecentRuns/findRun always have a base dir. */
+let runStoreCwd: string = process.cwd();
+
+/** Recent runs, newest first, MERGING the in-memory registry with the on-disk
+ *  run store. The registry is authoritative for live status (a run executing in
+ *  THIS process); on-disk runs cover reloaded / other-session / other-process
+ *  runs. Registry wins on id collision. This is what makes /workflows,
+ *  /workflow-result, and get_workflow_result work after /reload. */
 function getRecentRuns(limit = 5): WorkflowRunState[] {
-  return Array.from(registry.values())
-    .map((e) => e.run)
+  const byId = new Map<string, WorkflowRunState>();
+  for (const p of listRunFiles(runStoreDir(runStoreCwd))) byId.set(p.id, fromPersistedRun(p));
+  for (const e of registry.values()) byId.set(e.run.id, e.run);
+  return Array.from(byId.values())
     .sort((a, b) => b.startTime - a.startTime)
     .slice(0, limit);
 }
 
 /** Find a run by name or run id. Defaults to the most recent run.
- *  When matching by name, prefers the most recent run with that name. */
+ *  An explicit id resolves directly (registry then disk) so even an old run
+ *  that has aged out of the recent-runs cache still loads. When matching by
+ *  name, prefers the most recent run with that name. */
 function findRun(nameOrId?: string): WorkflowRunState | undefined {
+  if (nameOrId) {
+    const key = nameOrId.trim();
+    const reg = registry.get(key);
+    if (reg) return reg.run;
+    const onDisk = readRunFile(key, runStoreDir(runStoreCwd));
+    if (onDisk) return fromPersistedRun(onDisk);
+  }
   const runs = getRecentRuns(100);
   if (!nameOrId) return runs[0];
   const key = nameOrId.trim();
   return runs.find((r) => r.id === key) ?? runs.find((r) => r.name === key);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Run Store (one JSON file per run, persisted to disk)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Runs are persisted so they (a) survive /reload, (b) are addressable by id,
+// and (c) are readable by an EXTERNAL process — a frontend or orchestrator
+// driving pi over RPC — which cannot see pi's in-memory registry. The store is
+// the lossless, structured, pollable channel for that integration. Files are
+// written atomically (write *.json.tmp then rename) so a reader never observes
+// a half-written file. See README "Programmatic / RPC integration".
+
+const RUN_SCHEMA_VERSION = 1;
+const RUN_FILE_EXT = ".json";
+const RUN_TMP_SUFFIX = ".json.tmp";
+/** Coalesce intermediate progress writes to at most one per this interval. */
+const RUN_WRITE_THROTTLE_MS = 1500;
+/** Retention: keep at most this many of the newest runs. */
+const RUN_RETENTION_MAX = 50;
+/** Retention: drop runs older than this. */
+const RUN_RETENTION_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+/** Never prune a run touched more recently than this (avoids racing a sibling
+ *  process's brand-new run before its first flush). */
+const RUN_PRUNE_MIN_AGE_MS = 60_000;
+
+/** Provenance threaded into each persisted run. */
+interface RunMeta {
+  input: string;
+  cwd: string;
+  sessionId?: string;
+}
+
+/**
+ * THE single source of truth for where run files live. Resolution order:
+ *   1. $PI_WORKFLOWS_RUN_DIR (absolute path) — for a frontend / tests / OS-temp.
+ *   2. <nearest .pi>/workflow-runs  (sibling of .pi/workflows — project-scoped).
+ *   3. <cwd>/.pi/workflow-runs      (fallback when no .pi/workflows exists yet).
+ * Project-scoped (not session-scoped) so runs stay visible across /reload,
+ * /new, /resume, and to external readers; sessionId is recorded INSIDE each
+ * file for optional per-session filtering.
+ */
+function runStoreDir(cwd: string): string {
+  const override = process.env.PI_WORKFLOWS_RUN_DIR;
+  if (override && override.trim()) return override.trim();
+  const wfDir = findWorkflowsDir(cwd); // .../.pi/workflows
+  const piDir = wfDir ? path.dirname(wfDir) : path.join(cwd, ".pi");
+  return path.join(piDir, "workflow-runs");
+}
+
+/** Absolute path to a run's JSON file. */
+function runFilePath(id: string, cwd: string): string {
+  return path.join(runStoreDir(cwd), `${id}${RUN_FILE_EXT}`);
+}
+
+/** Ensure the run-store directory exists; returns it. Idempotent. */
+function ensureRunStoreDir(cwd: string): string {
+  const dir = runStoreDir(cwd);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/** Build the on-disk shape from a live run + provenance. */
+function toPersistedRun(state: WorkflowRunState, meta: RunMeta): PersistedRun {
+  return {
+    schemaVersion: RUN_SCHEMA_VERSION,
+    id: state.id,
+    name: state.name,
+    status: state.status,
+    phases: state.phases,
+    currentPhase: state.currentPhase,
+    startTime: state.startTime,
+    endTime: state.endTime,
+    error: state.error,
+    input: meta.input,
+    cwd: meta.cwd,
+    pid: process.pid,
+    sessionId: meta.sessionId,
+    usage: totalRunUsage(state),
+    updatedAt: Date.now(),
+  };
+}
+
+/** Map a persisted run back to the live WorkflowRunState used everywhere.
+ *  "interrupted" (a dead-owner run) maps to "failed" with an explanation. */
+function fromPersistedRun(p: PersistedRun): WorkflowRunState {
+  const interrupted = p.status === "interrupted";
+  return {
+    id: p.id,
+    name: p.name,
+    status: interrupted ? "failed" : p.status,
+    phases: p.phases ?? {},
+    currentPhase: p.currentPhase,
+    startTime: p.startTime,
+    endTime: p.endTime,
+    error: interrupted
+      ? (p.error ?? "Interrupted (the process running this workflow exited).")
+      : p.error,
+  };
+}
+
+/** Atomically persist a PersistedRun: write <id>.json.tmp then rename to
+ *  <id>.json. rename(2) is atomic when src and dst share a filesystem — they
+ *  always do here (same directory) — so an external reader sees either the old
+ *  complete file or the new one, never a torn write. Persistence must never
+ *  break a run: on any failure, warn and continue in-memory. */
+function writePersistedRun(p: PersistedRun, cwd: string): void {
+  try {
+    const dir = ensureRunStoreDir(cwd);
+    const finalPath = path.join(dir, `${p.id}${RUN_FILE_EXT}`);
+    const tmpPath = path.join(dir, `${p.id}${RUN_TMP_SUFFIX}`);
+    fs.writeFileSync(tmpPath, JSON.stringify(p, null, 2));
+    fs.renameSync(tmpPath, finalPath);
+  } catch (err: any) {
+    currentCtx?.ui.notify(
+      `Workflow run could not be persisted: ${err?.message ?? err}`,
+      "warning",
+    );
+  }
+}
+
+/** Persist a live run (convenience over writePersistedRun). */
+function writeRunFile(state: WorkflowRunState, meta: RunMeta): void {
+  writePersistedRun(toPersistedRun(state, meta), meta.cwd);
+}
+
+/** Read one run file by id. Returns undefined if missing / corrupt. */
+function readRunFile(id: string, dir: string): PersistedRun | undefined {
+  try {
+    const parsed = JSON.parse(
+      fs.readFileSync(path.join(dir, `${id}${RUN_FILE_EXT}`), "utf8"),
+    ) as PersistedRun;
+    return parsed && typeof parsed.id === "string" ? parsed : undefined;
+  } catch {
+    return undefined; // missing, mid-write (shouldn't happen w/ atomic), or bad JSON
+  }
+}
+
+/** All run files in the store, newest first. Skips *.json.tmp and corrupt ones. */
+function listRunFiles(dir: string): PersistedRun[] {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return []; // dir doesn't exist yet
+  }
+  const runs: PersistedRun[] = [];
+  for (const n of names) {
+    // ".json.tmp" ends with ".tmp", not ".json", so this also excludes temps.
+    if (!n.endsWith(RUN_FILE_EXT)) continue;
+    const p = readRunFile(n.slice(0, -RUN_FILE_EXT.length), dir);
+    if (p) runs.push(p);
+  }
+  runs.sort((a, b) => b.startTime - a.startTime);
+  return runs;
+}
+
+/** Last write time per run id, for throttling intermediate progress writes. */
+const lastRunWrite = new Map<string, number>();
+const pendingRunWrite = new Map<string, ReturnType<typeof setTimeout>>();
+
+/**
+ * Persist a run, throttled. A terminal status (completed/failed/cancelled)
+ * forces an immediate, guaranteed write and clears any pending timer, so the
+ * final file is always complete and current. Intermediate progress is coalesced
+ * to at most one write per RUN_WRITE_THROTTLE_MS; the trailing write serializes
+ * the latest state (executeWorkflow mutates one state object in place).
+ */
+function scheduleRunWrite(state: WorkflowRunState, meta: RunMeta): void {
+  const terminal = state.status !== "running";
+  const now = Date.now();
+  const last = lastRunWrite.get(state.id) ?? 0;
+
+  const flush = () => {
+    const t = pendingRunWrite.get(state.id);
+    if (t) {
+      clearTimeout(t);
+      pendingRunWrite.delete(state.id);
+    }
+    lastRunWrite.set(state.id, Date.now());
+    writeRunFile(state, meta);
+  };
+
+  if (terminal || now - last >= RUN_WRITE_THROTTLE_MS) {
+    flush();
+    if (terminal) lastRunWrite.delete(state.id); // run is done; clean up
+    return;
+  }
+  if (!pendingRunWrite.has(state.id)) {
+    pendingRunWrite.set(state.id, setTimeout(flush, RUN_WRITE_THROTTLE_MS - (now - last)));
+  }
+}
+
+/** Whether a process is alive. signal 0 only probes existence; EPERM means it
+ *  exists but isn't ours. */
+function isProcessAlive(pid: number): boolean {
+  if (!pid || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    return e?.code === "EPERM";
+  }
+}
+
+/**
+ * On startup / reload, reconcile the on-disk store: any run still marked
+ * "running" whose owning process is gone is rewritten as "interrupted", since
+ * its in-process executor no longer exists and can never complete it.
+ *
+ * Conservative rule: only a dead PID triggers this. A reloaded-but-alive
+ * process (same PID) leaves its run "running"; that process's own executor
+ * keeps writing and its terminal write reconciles the file.
+ */
+function rehydrateRuns(cwd: string): void {
+  for (const p of listRunFiles(runStoreDir(cwd))) {
+    if (p.status !== "running" || isProcessAlive(p.pid)) continue;
+    writePersistedRun(
+      {
+        ...p,
+        status: "interrupted",
+        endTime: p.endTime ?? Date.now(),
+        error: p.error ?? "Interrupted (the process running this workflow exited).",
+        updatedAt: Date.now(),
+      },
+      cwd,
+    );
+  }
+}
+
+/**
+ * Retention: delete runs older than RUN_RETENTION_MAX_AGE_MS and, of what
+ * remains, keep only the newest RUN_RETENTION_MAX. Never prunes a running run
+ * with a live owner or a very recently touched run. Sweeps orphaned *.json.tmp.
+ * Notifies what was pruned (no silent deletion).
+ */
+function pruneRunStore(cwd: string): void {
+  const dir = runStoreDir(cwd);
+  let entries: PersistedRun[];
+  try {
+    entries = listRunFiles(dir); // newest first
+  } catch {
+    return;
+  }
+
+  // Sweep orphaned temp files (a crash between write and rename).
+  try {
+    for (const n of fs.readdirSync(dir)) {
+      if (n.endsWith(RUN_TMP_SUFFIX)) {
+        try {
+          fs.unlinkSync(path.join(dir, n));
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  } catch {
+    /* dir missing */
+  }
+
+  const now = Date.now();
+  const protect = (p: PersistedRun) =>
+    (p.status === "running" && isProcessAlive(p.pid)) ||
+    now - (p.updatedAt ?? p.startTime) < RUN_PRUNE_MIN_AGE_MS;
+
+  const tooOld = entries.filter(
+    (p) => !protect(p) && now - (p.endTime ?? p.startTime) > RUN_RETENTION_MAX_AGE_MS,
+  );
+  const survivors = entries.filter((p) => !tooOld.includes(p)); // still newest-first
+  const overflow = survivors.filter((p) => !protect(p)).slice(RUN_RETENTION_MAX);
+
+  let deleted = 0;
+  for (const p of [...tooOld, ...overflow]) {
+    try {
+      fs.unlinkSync(path.join(dir, `${p.id}${RUN_FILE_EXT}`));
+      deleted++;
+    } catch {
+      /* ignore (ENOENT from a concurrent prune is fine) */
+    }
+  }
+  if (deleted > 0) {
+    currentCtx?.ui.notify(`Pruned ${deleted} old workflow run file(s).`, "info");
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1278,13 +1596,24 @@ function loadErrorsText(): string {
   return `\n\n${workflowLoadErrors.length} workflow file(s) failed to load:\n${lines.join("\n")}`;
 }
 
-/** Start a workflow in the background: register it so /workflows can track it,
- *  run it detached, and NOTIFY (not inject) on completion. The full result
- *  stays in the registry — pulled into context only via get_workflow_result,
- *  or viewed without context cost via /workflow-result. */
-function startBackgroundRun(def: WorkflowDefinition, cwd: string, input = ""): string {
+/** Start a workflow in the background: register it, persist it to the run store
+ *  (so /workflows, /workflow-result, get_workflow_result, and EXTERNAL readers
+ *  can track it), and run it detached.
+ *
+ *  On completion it does NOT wake pi's own agent. The run file is the
+ *  authoritative completion signal; a structured, non-waking marker
+ *  (deliverAs:"nextTurn") additionally carries the run id + result file path for
+ *  any RPC/orchestrator consumer reading the message stream. A passive toast
+ *  gives interactive users visual feedback without consuming context. */
+function startBackgroundRun(
+  def: WorkflowDefinition,
+  cwd: string,
+  input = "",
+  sessionId?: string,
+): string {
   const abortController = new AbortController();
   const runId = generateId();
+  const meta: RunMeta = { input, cwd, sessionId };
   const runState: WorkflowRunState = {
     id: runId,
     name: def.name,
@@ -1293,21 +1622,26 @@ function startBackgroundRun(def: WorkflowDefinition, cwd: string, input = ""): s
     startTime: Date.now(),
   };
   registry.set(runId, { run: runState, definition: def, abortController });
+  scheduleRunWrite(runState, meta); // persist the "running" run immediately
 
-  // Fire the toast + agent-nudge exactly once, when the run reaches a terminal
-  // state. onProgress can be called repeatedly; this guard keeps it to one.
+  // Announce terminal state exactly once. onProgress can be called repeatedly.
   let announced = false;
 
   /**
-   * Nudge the agent to tell the user the run is done. Delivered as a follow-up
-   * so it never interrupts whatever the agent is currently doing; `triggerTurn`
-   * makes it respond right away if idle. `display: false` keeps the nudge itself
-   * out of the transcript — only the agent's announcement shows.
+   * Structured, NON-waking completion marker. deliverAs:"nextTurn" never
+   * triggers a turn (so pi's own agent is not woken), yet the message still
+   * reaches an RPC client via the message stream / get_messages, carrying the
+   * run id and the path to the full result file.
    */
-  const nudgeAgent = (content: string) => {
+  const emitRunMarker = (status: "completed" | "failed", content: string) => {
     extensionApi?.sendMessage(
-      { customType: "workflow-status", content, display: false },
-      { deliverAs: "followUp", triggerTurn: true },
+      {
+        customType: "workflow-status",
+        content,
+        display: false,
+        details: { runId, name: def.name, status, file: runFilePath(runId, cwd), dir: runStoreDir(cwd) },
+      },
+      { deliverAs: "nextTurn" },
     );
   };
 
@@ -1317,36 +1651,41 @@ function startBackgroundRun(def: WorkflowDefinition, cwd: string, input = ""): s
     (updated) => {
       const entry = registry.get(runId);
       if (entry) entry.run = updated;
+      scheduleRunWrite(updated, meta); // throttled; force-flushes on terminal status
 
       if (announced) return;
       if (updated.status === "completed") {
         announced = true;
         currentCtx?.ui.notify(
-          `Workflow "${def.name}" complete. /workflow-result to view, or ask me to pull it in.`,
+          `Workflow "${def.name}" complete (run ${runId}). /workflow-result to view.`,
           "info",
         );
-        nudgeAgent(
-          `The background workflow "${def.name}" just finished successfully. ` +
-            "In one short sentence, let the user know it's done and that they can view the full " +
-            "results with the /workflow-result command (or ask you to pull them in via " +
-            "get_workflow_result). Do not fetch or summarize the results unless the user asks.",
-        );
+        emitRunMarker("completed", `Workflow "${def.name}" (run ${runId}) completed.`);
       } else if (updated.status === "failed") {
         announced = true;
         currentCtx?.ui.notify(
-          `Workflow "${def.name}" failed: ${updated.error || "Unknown error"}`,
+          `Workflow "${def.name}" failed (run ${runId}): ${updated.error || "Unknown error"}`,
           "error",
         );
-        nudgeAgent(
-          `The background workflow "${def.name}" just failed: ${updated.error || "Unknown error"}. ` +
-            "Briefly let the user know it failed and offer to look into it.",
+        emitRunMarker(
+          "failed",
+          `Workflow "${def.name}" (run ${runId}) failed: ${updated.error || "Unknown error"}`,
         );
       }
     },
     abortController.signal,
     runId,
     input,
-  ).catch(() => {});
+  ).then(
+    // Guarantee a final on-disk write even if some future early-return path
+    // skips a terminal onProgress. Redundant with scheduleRunWrite's force-flush
+    // in the normal case; harmless (atomic).
+    (final) => writeRunFile(final, meta),
+    () => {
+      const e = registry.get(runId);
+      if (e) writeRunFile(e.run, meta);
+    },
+  );
 
   return runId;
 }
@@ -1444,7 +1783,7 @@ function renderWorkflowProgress(
     let icon: string;
     switch (run.status) {
       case "running":
-        icon = theme.fg("warning", "â¦");
+        icon = theme.fg("warning", "●");
         break;
       case "completed":
         icon = theme.fg("success", "✓");
@@ -1462,7 +1801,7 @@ function renderWorkflowProgress(
     const usageStr = formatUsage(totalRunUsage(run));
     const usageSuffix = usageStr ? ` ${theme.fg("dim", usageStr)}` : "";
     lines.push(
-      `  ${icon} ${theme.bold(run.name)} ${theme.fg("muted", `[${run.status}]`)} ${theme.fg("dim", durStr)}${usageSuffix}`,
+      `  ${icon} ${theme.fg("dim", run.id)} ${theme.bold(run.name)} ${theme.fg("muted", `[${run.status}]`)} ${theme.fg("dim", durStr)}${usageSuffix}`,
     );
 
     // Phase progress
@@ -1476,7 +1815,7 @@ function renderWorkflowProgress(
           statusColor = "success";
           break;
         case "running":
-          statusIcon = theme.fg("warning", "â¦");
+          statusIcon = theme.fg("warning", "●");
           statusColor = "warning";
           break;
         case "failed":
@@ -1578,29 +1917,97 @@ function renderWorkflowList(
 // Extension Entry Point
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * Headless one-shot: run a workflow to completion, persist it, and exit the
+ * process. Backs `--run-workflow <name> [--workflow-input "<text>"]`, giving an
+ * external orchestrator the same "spawn pi → wait → read the result file" shape
+ * it uses for any subprocess — but agent-free and deterministic. The
+ * agent-facing peer is the run_workflow tool; both share this engine + the run
+ * store, so a run fired either way is identical downstream. Prints the absolute
+ * run-file path as the final stdout line; exits 0 (completed), 1 (failed), or 2
+ * (unknown workflow name).
+ */
+async function runWorkflowHeadless(
+  ctx: ExtensionContext,
+  name: string,
+  input: string,
+): Promise<never> {
+  const workflows = await discoverWorkflows(ctx.cwd).catch(
+    () => new Map<string, WorkflowDefinition>(),
+  );
+  const def = workflows.get(name);
+  if (!def) {
+    const available = Array.from(workflows.keys()).join(", ") || "none";
+    process.stderr.write(`[workflows] --run-workflow: "${name}" not found. Available: ${available}\n`);
+    return process.exit(2);
+  }
+
+  const runId = generateId();
+  const meta: RunMeta = { input, cwd: ctx.cwd, sessionId: ctx.sessionManager?.getSessionId?.() };
+  registry.set(runId, {
+    run: { id: runId, name: def.name, status: "running", phases: {}, startTime: Date.now() },
+    definition: def,
+    abortController: new AbortController(),
+  });
+  scheduleRunWrite(registry.get(runId)!.run, meta);
+
+  let state: WorkflowRunState;
+  try {
+    state = await executeWorkflow(
+      def,
+      ctx.cwd,
+      (updated) => {
+        const e = registry.get(runId);
+        if (e) e.run = updated;
+        scheduleRunWrite(updated, meta);
+      },
+      undefined,
+      runId,
+      input,
+    );
+  } catch (err: any) {
+    const e = registry.get(runId);
+    state = e?.run ?? { id: runId, name: def.name, status: "failed", phases: {}, startTime: Date.now() };
+    state.status = "failed";
+    state.error = err?.message || String(err);
+    state.endTime = Date.now();
+  }
+
+  writeRunFile(state, meta); // synchronous force-write before we exit
+  // Final stdout line = the deliverable's path; the spawning process reads the
+  // full PersistedRun JSON (status + per-phase output) from it, like a result file.
+  process.stdout.write(`${runFilePath(runId, ctx.cwd)}\n`);
+  return process.exit(state.status === "completed" ? 0 : 1);
+}
+
 export default function (pi: ExtensionAPI) {
   extensionApi = pi;
+
+  // Headless trigger (agent-free peer of the run_workflow tool):
+  //   pi --run-workflow <name> [--workflow-input "<text>"]
+  // runs the workflow to completion, writes its run file, then exits. Launch it
+  // from an orchestrator in a non-interactive mode, e.g.
+  //   pi --mode rpc --no-session --run-workflow daily-brief --workflow-input "…"
+  pi.registerFlag("run-workflow", {
+    description: "Run a .pi/workflows workflow to completion headlessly, write its run file, then exit.",
+    type: "string",
+  });
+  pi.registerFlag("workflow-input", {
+    description: "Free-text input for --run-workflow (phases read it as ctx.input).",
+    type: "string",
+  });
 
   // ── Tool: run_workflow ────────────────────────────────────────────────
 
   pi.registerTool({
     name: "run_workflow",
     label: "Run Workflow",
-    description: [
-      "Start a defined workflow (from .pi/workflows/*.js).",
-      "Runs in the BACKGROUND by default and returns immediately, so the conversation is never blocked while phases execute.",
-      "Workflows execute phases sequentially or in parallel using sub-agents; outputs flow phase to phase via code, never touching the main context window.",
-      "Pass `input` to parameterize the run — phases read it via ctx.input (e.g. what change to scout for, what topic to research).",
-      "When a background run finishes, the user is notified and you receive a follow-up nudge to announce it; retrieve its full output later with get_workflow_result.",
-      "Supports structured schemas, conditionals, loops, budgets, and automatic retries.",
-    ].join(" "),
-    promptSnippet: "Start a named workflow in the background (orchestrated by code, not the LLM)",
+    description:
+      "Start a defined .pi/workflows/*.js workflow. Runs in the background and returns immediately; pass `input` to parameterize it (phases read ctx.input). Retrieve a finished run's full output later with get_workflow_result.",
+    promptSnippet: "Run a named .pi/workflows/*.js workflow in the background",
     promptGuidelines: [
-      "Use run_workflow when the user wants to execute a multi-step workflow defined in .pi/workflows/.",
-      "Pass run_workflow's `input` with the user's specifics (the change to make, the topic to research) when the workflow expects parameterization.",
-      "run_workflow starts in the background by default and returns right away — after calling it, briefly confirm it started and continue; do NOT wait for it.",
-      "Do not set wait:true unless the user explicitly asks to block until the workflow finishes.",
-      "To report a finished workflow's results, call get_workflow_result rather than re-running it.",
+      "After calling run_workflow, briefly confirm it started and continue — it runs in the background; do not wait for it.",
+      "To report a finished workflow, call get_workflow_result rather than re-running it.",
     ],
     parameters: Type.Object({
       name: Type.String({ description: "Name of the workflow to run" }),
@@ -1654,10 +2061,11 @@ export default function (pi: ExtensionAPI) {
       }
 
       const doWait = params.wait ?? false;
+      const sessionId = ctx.sessionManager?.getSessionId?.();
 
       // For background execution, spawn async and return immediately
       if (!doWait) {
-        const runId = startBackgroundRun(def, ctx.cwd, input);
+        const runId = startBackgroundRun(def, ctx.cwd, input, sessionId);
 
         return {
           content: [
@@ -1665,31 +2073,47 @@ export default function (pi: ExtensionAPI) {
               type: "text",
               text:
                 `Workflow "${def.name}" started in the background (run ${runId}). ` +
-                `The conversation is not blocked — it runs while we keep talking. ` +
-                `Watch progress with /workflows; you'll be notified on completion, and can view the full output with /workflow-result or by asking me to fetch it.`,
+                `It runs while we keep talking; the conversation is not blocked. ` +
+                `Retrieve its full output later with get_workflow_result (or the user can run /workflow-result, or read ${runFilePath(runId, ctx.cwd)}).`,
             },
           ],
-          details: { runId },
+          // Structured pointers so an RPC client watching tool_execution_end can
+          // correlate this call to the run's on-disk file.
+          details: { runId, name: def.name, file: runFilePath(runId, ctx.cwd), dir: runStoreDir(ctx.cwd) },
         };
       }
 
-      // Synchronous execution with progress streaming
+      // Synchronous execution with progress streaming. Register + persist it too
+      // (with a real run id) so it is addressable and survives like background runs.
       const abortController = new AbortController();
       if (signal) {
         signal.addEventListener("abort", () => abortController.abort(), { once: true });
       }
 
+      const runId = generateId();
+      const meta: RunMeta = { input, cwd: ctx.cwd, sessionId };
+      registry.set(runId, {
+        run: { id: runId, name: def.name, status: "running", phases: {}, startTime: Date.now() },
+        definition: def,
+        abortController,
+      });
+      scheduleRunWrite(registry.get(runId)!.run, meta);
+
       const state = await executeWorkflow(
         def,
         ctx.cwd,
         (updatedState) => {
+          const entry = registry.get(runId);
+          if (entry) entry.run = updatedState;
+          scheduleRunWrite(updatedState, meta);
+
           // Stream progress to the LLM
           const phaseEntries = Object.entries(updatedState.phases);
           const summary = phaseEntries
             .map(([name, pr]) => {
               const icon =
                 pr.status === "completed" ? "✓" :
-                pr.status === "running" ? "â¦" :
+                pr.status === "running" ? "●" :
                 pr.status === "failed" ? "✗" :
                 pr.status === "skipped" ? "→" : "○";
               return `  ${icon} ${name}: ${pr.status}`;
@@ -1707,9 +2131,14 @@ export default function (pi: ExtensionAPI) {
           });
         },
         abortController.signal,
-        undefined,
+        runId,
         input,
       );
+
+      // Guarantee a final on-disk write + registry sync.
+      const syncEntry = registry.get(runId);
+      if (syncEntry) syncEntry.run = state;
+      writeRunFile(state, meta);
 
       // Format final result
       if (state.status === "failed") {
@@ -1757,7 +2186,7 @@ export default function (pi: ExtensionAPI) {
         details.status === "completed" ? theme.fg("success", "✓") :
         details.status === "failed" ? theme.fg("error", "✗") :
         details.status === "cancelled" ? theme.fg("dim", "◼") :
-        theme.fg("warning", "â¦");
+        theme.fg("warning", "●");
 
       const dur = ((details.endTime ?? Date.now()) - details.startTime) / 1000;
       const durStr = dur < 60 ? `${dur.toFixed(1)}s` : `${(dur / 60).toFixed(1)}m`;
@@ -1769,7 +2198,7 @@ export default function (pi: ExtensionAPI) {
       for (const [name, pr] of Object.entries(details.phases)) {
         const icon =
           pr.status === "completed" ? theme.fg("success", "✓") :
-          pr.status === "running" ? theme.fg("warning", "â¦") :
+          pr.status === "running" ? theme.fg("warning", "●") :
           pr.status === "failed" ? theme.fg("error", "✗") :
           pr.status === "skipped" ? theme.fg("dim", "→") :
           theme.fg("dim", "○");
@@ -1834,19 +2263,13 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "get_workflow_result",
     label: "Get Workflow Result",
-    description: [
-      "Retrieve the full result of a workflow run that already executed (e.g. one started in the background).",
-      "Results are kept out of context until you call this; use it to pull a completed run's output into context on demand.",
-    ].join(" "),
-    promptSnippet: "Pull a completed workflow's full result into context",
-    promptGuidelines: [
-      "Use get_workflow_result when the user asks about the outcome of a workflow that finished running in the background.",
-    ],
+    description:
+      "Pull a completed workflow run's full output into context on demand (results stay out of context until you call this).",
+    promptSnippet: "Fetch a finished workflow's full result",
     parameters: Type.Object({
       name: Type.Optional(
         Type.String({
-          description:
-            "Workflow name or run id. Defaults to the most recent run if omitted.",
+          description: "Run id or workflow name. Defaults to the most recent run if omitted.",
         }),
       ),
     }),
@@ -1896,7 +2319,34 @@ export default function (pi: ExtensionAPI) {
     description: "Show live progress of workflow runs",
     handler: async (_args, ctx) => {
       if (!ctx.hasUI) {
-        ctx.ui.notify("/workflows requires interactive mode", "error");
+        // No TUI here (print / json / RPC). Emit a machine-readable summary
+        // instead of erroring: a one-line notify plus a structured, non-waking
+        // marker carrying the run-store dir + run ids/files for a programmatic
+        // client. (The interactive live viewer needs ctx.ui.custom, a no-op here.)
+        const runs = getRecentRuns(20);
+        ctx.ui.notify(
+          runs.length === 0
+            ? "No workflow runs yet."
+            : `Runs: ${runs.map((r) => `${r.id} ${r.name} [${r.status}]`).join("; ")}`,
+          "info",
+        );
+        pi.sendMessage(
+          {
+            customType: "workflow-status",
+            content: "workflow runs",
+            display: false,
+            details: {
+              dir: runStoreDir(ctx.cwd),
+              runs: runs.map((r) => ({
+                id: r.id,
+                name: r.name,
+                status: r.status,
+                file: runFilePath(r.id, ctx.cwd),
+              })),
+            },
+          },
+          { deliverAs: "nextTurn" },
+        );
         return;
       }
 
@@ -2020,9 +2470,22 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      startBackgroundRun(def, ctx.cwd, input);
+      const runId = startBackgroundRun(def, ctx.cwd, input, ctx.sessionManager?.getSessionId?.());
+      // Structured, non-waking ack so an RPC frontend learns the run id (and the
+      // path to its result file) without an LLM turn — /workflow is the
+      // recommended programmatic trigger over RPC. deliverAs:"nextTurn" never
+      // triggers a turn.
+      pi.sendMessage(
+        {
+          customType: "workflow-status",
+          content: `Started "${name}" (run ${runId}).`,
+          display: false,
+          details: { runId, name, status: "running", file: runFilePath(runId, ctx.cwd), dir: runStoreDir(ctx.cwd) },
+        },
+        { deliverAs: "nextTurn" },
+      );
       ctx.ui.notify(
-        `Started workflow "${name}"${input ? ` (input: ${input.slice(0, 40)}${input.length > 40 ? "…" : ""})` : ""}. Run /workflows to watch progress.`,
+        `Started workflow "${name}" (run ${runId})${input ? ` (input: ${input.slice(0, 40)}${input.length > 40 ? "…" : ""})` : ""}. Run /workflows to watch progress.`,
         "info",
       );
     },
@@ -2033,24 +2496,54 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("workflow-result", {
     description: "View the full result of a completed workflow run (no context cost)",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
-      const names = Array.from(new Set(getRecentRuns(100).map((r) => r.name)));
-      const items = names
-        .filter((n) => n.startsWith(prefix))
-        .map((n) => ({ value: n, label: n }));
+      const runs = getRecentRuns(100);
+      // Offer run ids (newest first, labelled with name) and distinct names so a
+      // run is addressable by either. Ids disambiguate multiple runs of one name.
+      const items: AutocompleteItem[] = [
+        ...runs.map((r) => ({ value: r.id, label: `${r.id} (${r.name})` })),
+        ...Array.from(new Set(runs.map((r) => r.name))).map((n) => ({ value: n, label: n })),
+      ].filter((i) => i.value.startsWith(prefix));
       return items.length > 0 ? items : null;
     },
     handler: async (args, ctx) => {
-      const run = findRun(args.trim() || undefined);
-      if (!run) {
-        ctx.ui.notify("No workflow runs yet. Start one with /workflow <name>.", "info");
-        return;
-      }
+      // Resolve which run to view: an explicit arg (id first, then most-recent
+      // by name); otherwise the single finished run, or a picker when several.
+      const run = await (async (): Promise<WorkflowRunState | undefined> => {
+        const arg = args.trim();
+        if (arg) {
+          const r = findRun(arg);
+          if (!r) ctx.ui.notify(`No workflow run matching "${arg}".`, "info");
+          return r;
+        }
+        const finished = getRecentRuns(50).filter((r) => r.status !== "running");
+        if (finished.length === 0) {
+          ctx.ui.notify("No completed workflow runs yet. Start one with /workflow <name>.", "info");
+          return undefined;
+        }
+        if (finished.length === 1 || !ctx.hasUI) return finished[0];
+        const labels = finished.map((r) => `${r.id} · ${r.name} · ${r.status} · ${ageStr(r)}`);
+        const choice = await ctx.ui.select("View which run?", labels);
+        return choice ? finished[labels.indexOf(choice)] : undefined;
+      })();
+
+      if (!run) return; // nothing to show (already notified where relevant)
       if (run.status === "running") {
         ctx.ui.notify(`Workflow "${run.name}" is still running — see /workflows.`, "info");
         return;
       }
       if (!ctx.hasUI) {
+        // No TUI viewer here; emit a truncated summary + a structured marker
+        // pointing at the full untruncated result file.
         ctx.ui.notify(buildResultText(run.name, run).slice(0, 300), "info");
+        pi.sendMessage(
+          {
+            customType: "workflow-status",
+            content: `result for ${run.name}`,
+            display: false,
+            details: { runId: run.id, name: run.name, status: run.status, file: runFilePath(run.id, ctx.cwd) },
+          },
+          { deliverAs: "nextTurn" },
+        );
         return;
       }
 
@@ -2112,7 +2605,31 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
+    runStoreCwd = ctx.cwd;
     if (ctx.model) defaultModel = ctx.model;
+
+    // Headless one-shot: `--run-workflow <name>` runs to completion and exits,
+    // before this session ever becomes interactive. Agent-free peer of the
+    // run_workflow tool — same engine + run store.
+    const headlessName = pi.getFlag("run-workflow");
+    if (typeof headlessName === "string" && headlessName.trim()) {
+      const headlessInput = pi.getFlag("workflow-input");
+      await runWorkflowHeadless(
+        ctx,
+        headlessName.trim(),
+        typeof headlessInput === "string" ? headlessInput : "",
+      );
+      return; // unreachable — runWorkflowHeadless exits the process
+    }
+
+    // Reconcile the on-disk store: mark runs orphaned by a dead process as
+    // interrupted, then prune. This is what makes runs survive /reload.
+    try {
+      rehydrateRuns(ctx.cwd);
+      pruneRunStore(ctx.cwd);
+    } catch {
+      /* never let store maintenance break session start */
+    }
     await discoverWorkflows(ctx.cwd).catch(() => {});
   });
 
@@ -2121,28 +2638,47 @@ export default function (pi: ExtensionAPI) {
     if (event.model) defaultModel = event.model;
   });
 
-  // ── Status line: show running workflow count via footer widget ───────
+  // ── Status: show active background runs in a widget BELOW the editor ──
+  //
+  // Deliberately rendered below the editor (not the default aboveEditor): pi's
+  // own "Working…" loader row sits just above the editor, so an above-editor
+  // widget with a status glyph + elapsed timer reads as a SECOND working
+  // indicator. Below-editor + dim styling + the workflow name keeps it clearly
+  // a separate "background workflow" panel. The static ● is intentionally NOT
+  // pi's animated braille spinner. Cleared with undefined when nothing is live.
+
+  const renderRunWidget = (active: WorkflowRunState[]) =>
+    (_tui: unknown, theme: ThemeLike) => {
+      const lines = active.map((r) => {
+        const dur = ((Date.now() - r.startTime) / 1000).toFixed(0);
+        const phase = r.currentPhase ? ` → ${r.currentPhase}` : "";
+        return (
+          theme.fg("accent", "● ") +
+          theme.fg("muted", `${r.name}${phase}`) +
+          theme.fg("dim", ` · ${dur}s`)
+        );
+      });
+      return { render: () => lines, invalidate: () => {} };
+    };
+
+  const refreshRunWidget = (ctx: ExtensionContext) => {
+    const active = getRecentRuns(10).filter((r) => r.status === "running");
+    if (active.length === 0) {
+      ctx.ui.setWidget("workflows", undefined); // clear
+    } else {
+      ctx.ui.setWidget("workflows", renderRunWidget(active), { placement: "belowEditor" });
+    }
+  };
 
   pi.on("turn_start", async (_event, ctx) => {
     currentCtx = ctx;
+    runStoreCwd = ctx.cwd;
     if (ctx.model) defaultModel = ctx.model;
-    const runs = getRecentRuns(10);
-    const active = runs.filter((r) => r.status === "running");
-    if (active.length > 0) {
-      const widgets = active.map((r) => {
-        const dur = ((Date.now() - r.startTime) / 1000).toFixed(0);
-        const phase = r.currentPhase || "";
-        return `â¦ ${r.name} (${dur}s)${phase ? ` → ${phase}` : ""}`;
-      });
-      ctx.ui.setWidget("workflows", widgets);
-    }
+    refreshRunWidget(ctx);
   });
 
   pi.on("turn_end", async (_event, ctx) => {
     currentCtx = ctx;
-    const active = getRecentRuns(10).filter((r) => r.status === "running");
-    if (active.length === 0) {
-      ctx.ui.setWidget("workflows", []);
-    }
+    refreshRunWidget(ctx);
   });
 }

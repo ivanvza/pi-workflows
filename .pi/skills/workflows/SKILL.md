@@ -1,13 +1,10 @@
 ---
 name: workflows
 description: >-
-  Author, edit, and run pi workflows — deterministic, code-routed multi-agent
-  pipelines defined in .pi/workflows/*.js. Use when the user asks to create,
-  build, edit, scaffold, or run a workflow / multi-step automation. Covers the
-  two phase types (prompt = model, code = deterministic JS), choosing between
-  them, schema shorthand, ctx (previous / input / workflow), parallel /
-  condition / loop / map, agents in .pi/agents/, and running via /workflow or
-  the run_workflow tool.
+  Build, edit, and run pi workflows — deterministic, code-routed multi-agent
+  pipelines in .pi/workflows/*.js (prompt phases = model judgment, code phases =
+  plain JS). Use when asked to create, scaffold, edit, or run a workflow or
+  multi-step automation.
 ---
 
 # Workflows — build & run
@@ -204,8 +201,12 @@ Copy-paste patterns: [references/recipes.md](references/recipes.md).
   instead of silently dropping all workflows. After writing a file, have the user
   run `/workflow-list` to confirm it loaded (no `/reload` needed for workflow files).
 - **Run:** `/workflow <name> [input…]` (background) — trailing text becomes
-  `ctx.input`. Or the agent calls `run_workflow({ name, input })`.
-- **Watch:** `/workflows`. **Read full output:** `/workflow-result`.
+  `ctx.input`. Or the agent calls `run_workflow({ name, input })`. Each run gets
+  an id (`wf_…`) and is persisted to `.pi/workflow-runs/<id>.json`.
+- **Watch:** `/workflows`. **Read full output:** `/workflow-result` (no arg →
+  pick from recent runs; or pass a run id / name) or `get_workflow_result({ name })`.
+- **Completion does not wake the agent.** A passive toast fires and the run file
+  is written; report results only when the user asks (then call get_workflow_result).
 
 ## Gotchas
 
@@ -218,7 +219,9 @@ Copy-paste patterns: [references/recipes.md](references/recipes.md).
 - **Parallel output is nested** under the parent name; siblings can't see each other.
 - **Loops store only the final iteration.**
 - **Phases can't recurse into workflows** (sub-agents load no extensions).
-- **Budgets are advisory.** **Run state is in-memory** (cleared on `/reload`).
+- **Budgets are advisory.** **Runs persist** to `.pi/workflow-runs/<id>.json`
+  (override the dir with `$PI_WORKFLOWS_RUN_DIR`) and survive `/reload`; an
+  external process can list/watch/read them — see the README's RPC section.
 
 A complete annotated reference also ships at
 `.pi/extensions/workflows/README.md`.

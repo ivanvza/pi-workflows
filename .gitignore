@@ -1,6 +1,12 @@
 # Private workflows — not included in the package
 .pi/workflows/*.js
 
+# Persisted workflow run state (runtime data, one JSON file per run)
+.pi/workflow-runs/
+
+# Local project guidance (not shipped, not tracked)
+/CLAUDE.md
+
 # Git clone artifacts
 .pi/git/
 .pi/npm/
