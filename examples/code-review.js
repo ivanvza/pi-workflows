@@ -97,9 +97,9 @@ export default async function ({ agent, parallel, phase, log, args }) {
   const review = await agent(
     "Synthesize a comprehensive code review from these findings.\n\n" +
       `Architecture: ${JSON.stringify(analysis)}\n` +
-      `Lint: ${JSON.stringify(lint)}\n` +
+      `Lint: ${JSON.stringify(lint ?? {})}\n` +
       `Security (worst first): ${JSON.stringify(vulns)}\n` +
-      `Tests: ${JSON.stringify(tests)}\n\n` +
+      `Tests: ${JSON.stringify(tests ?? {})}\n\n` +
       "Provide an executive summary, prioritized recommendations with severity, and a 1-10 health score.",
     {
       agent: "reviewer",

@@ -47,6 +47,7 @@ export default async function ({ agent, phase, log, args }) {
           },
         },
       },
+      tools: [], // return-only: reasons over the passed-in JSON, writes nothing
       label: "transform",
     },
   );
@@ -62,6 +63,7 @@ export default async function ({ agent, phase, log, args }) {
         risks: "string[]",
         recommendations: "string[]",
       },
+      tools: [], // pure reasoning over the passed-in JSON — no filesystem access
       label: "validate",
     },
   );

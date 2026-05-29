@@ -4,7 +4,7 @@ Copy any of these into your project's `.pi/workflows/` to run them.
 
 Each workflow is an ES module that exports a `meta` object and a default
 `async function`. The function body is plain JS orchestration: `code` is just
-code, control flow is just `if`/`for`, and data flows phase→phase through
+code, control flow is just `if`/`for`, and data flows step→step through
 ordinary local variables. The model is reached only through the injected
 `agent()` helper.
 

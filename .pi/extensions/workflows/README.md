@@ -119,7 +119,7 @@ A workflow file is an **ES module** with two exports:
 export const meta = {
   name: "code-review",                       // REQUIRED — the /workflow <name> + discovery key
   description: "Comprehensive code review",  // shown in /workflow-list and list_workflows
-  phases: ["analyze", "checks⇉", "review"],  // OPTIONAL display-only flow hint
+  phases: ["analyze", "checks⇉", "review", "report"], // OPTIONAL display-only flow hint
 };
 
 export default async function (rt) {
@@ -404,7 +404,7 @@ number of sessions. Excess tasks queue and start as slots free up.
 | `/workflow <name> [input…] [--wait]` | Start a workflow (Tab-completes names); trailing text becomes `args`. Background by default (prints the run id); `--wait` blocks — in the TUI a live progress view then a scrollable result (Esc cancels/closes), over RPC a synchronous run + terminal marker |
 | `/workflows` | Live progress of all runs (run id, step status, timings, token usage) |
 | `/workflow-result [id\|name]` | Scroll the full output of a finished run (no context cost). With no argument and several finished runs, prompts you to pick one |
-| `run_workflow` (tool) | The agent starts a workflow — **background by default** (`wait:true` to block); takes `name` + optional `input`. Returns the run id + result-file path |
+| `run_workflow` (tool) | The agent starts a workflow — **background by default** (`wait:true` to block); takes `name` + optional `input`. Background returns the run id + result-file path; `wait:true` returns the full result |
 | `list_workflows` (tool) | The agent lists discovered workflows (names + descriptions) |
 | `get_workflow_result` (tool) | The agent pulls a finished run's output into context on demand; resolve by run id or name |
 

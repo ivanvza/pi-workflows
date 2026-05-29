@@ -6,6 +6,7 @@
 
 # Local project guidance (not shipped, not tracked)
 /CLAUDE.md
+/.claude/
 
 # Git clone artifacts
 .pi/git/

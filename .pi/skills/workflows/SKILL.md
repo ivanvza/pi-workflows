@@ -184,7 +184,8 @@ Access the result as plain JS: `const { summary, score } = await agent(…)`.
 
 ## Personas (`.pi/agents/*.md`)
 
-`{ agent: "scout" }` resolves to `.pi/agents/scout.md`:
+`{ agent: "scout" }` resolves to `.pi/agents/scout.md` (project), or
+`~/.pi/agent/agents/scout.md` for a user-level persona — project wins on a name clash:
 
 ```markdown
 ---
